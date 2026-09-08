@@ -49,24 +49,25 @@ class FeedItem:
     uid: str
     title: str
     uri: str
-    published: datetime
+    published: datetime | None
     summary: str | None = None
     image_url: str | None = None
     categories: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["published"] = self.published.isoformat()
+        data["published"] = self.published.isoformat() if self.published else None
         data["categories"] = list(self.categories)
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FeedItem":
+        published = data.get("published")
         return cls(
             uid=str(data["uid"]),
             title=str(data["title"]),
             uri=str(data["uri"]),
-            published=datetime.fromisoformat(str(data["published"])),
+            published=datetime.fromisoformat(str(published)) if published else None,
             summary=data.get("summary"),
             image_url=data.get("image_url"),
             categories=tuple(data.get("categories", [])),
