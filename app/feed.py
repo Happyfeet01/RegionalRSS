@@ -68,7 +68,8 @@ def build_rss(
         ET.SubElement(item_node, "title").text = item.title
         ET.SubElement(item_node, "link").text = item.uri
         ET.SubElement(item_node, "guid", {"isPermaLink": "true"}).text = item.uri
-        ET.SubElement(item_node, "pubDate").text = _rfc2822(item.published)
+        if item.published is not None:
+            ET.SubElement(item_node, "pubDate").text = _rfc2822(item.published)
         if item.summary:
             ET.SubElement(item_node, "description").text = item.summary
         ET.SubElement(item_node, f"{{{CONTENT_NS}}}encoded").text = _item_html(
