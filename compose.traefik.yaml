@@ -1,0 +1,22 @@
+services:
+  regionalrss:
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-proxy}
+      traefik.http.routers.regionalrss.rule: Host(`${FEED_HOST}`)
+      traefik.http.routers.regionalrss.entrypoints: websecure
+      traefik.http.routers.regionalrss.tls: "true"
+      traefik.http.routers.regionalrss.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.services.regionalrss.loadbalancer.server.port: "8080"
+      traefik.http.middlewares.regionalrss-ratelimit.ratelimit.average: "30"
+      traefik.http.middlewares.regionalrss-ratelimit.ratelimit.period: 1m
+      traefik.http.middlewares.regionalrss-ratelimit.ratelimit.burst: "10"
+      traefik.http.routers.regionalrss.middlewares: regionalrss-ratelimit@docker
+    networks:
+      - default
+      - traefik
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-proxy}

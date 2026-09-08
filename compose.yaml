@@ -1,0 +1,37 @@
+services:
+  regionalrss:
+    build:
+      context: .
+    image: regionalrss:local
+    container_name: regionalrss
+    restart: unless-stopped
+    init: true
+    read_only: true
+    ports:
+      - "127.0.0.1:8787:8080"
+    environment:
+      REGIONALRSS_PUBLIC_BASE_URL: ${REGIONALRSS_PUBLIC_BASE_URL:-}
+      REGIONALRSS_USER_AGENT: ${REGIONALRSS_USER_AGENT:-RegionalRSS/0.2}
+      REGIONALRSS_SITE_TITLE: ${REGIONALRSS_SITE_TITLE:-RegionalRSS}
+      REGIONALRSS_SOURCES_DIR: /app/sources
+      REGIONALRSS_CACHE_PATH: /data/cache.sqlite3
+      REGIONALRSS_TIMEOUT_SECONDS: ${REGIONALRSS_TIMEOUT_SECONDS:-12}
+      REGIONALRSS_MAX_RESPONSE_BYTES: ${REGIONALRSS_MAX_RESPONSE_BYTES:-5242880}
+      REGIONALRSS_ALLOW_PRIVATE_HOSTS: "false"
+      REGIONALRSS_ADMIN_USER: ${REGIONALRSS_ADMIN_USER:-}
+      REGIONALRSS_ADMIN_PASSWORD_HASH: ${REGIONALRSS_ADMIN_PASSWORD_HASH:-}
+      REGIONALRSS_SESSION_SECRET: ${REGIONALRSS_SESSION_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - regionalrss_sources:/app/sources
+      - regionalrss_data:/data
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  regionalrss_sources:
+  regionalrss_data:

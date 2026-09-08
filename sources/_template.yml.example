@@ -1,0 +1,33 @@
+id: beispiel-aktuelles
+name: Beispielseite – Aktuelles
+description: Neue Meldungen der Beispielseite.
+site_url: https://www.example.org/
+list_url: https://www.example.org/aktuelles/
+language: de-DE
+timezone: Europe/Berlin
+cache_seconds: 1800
+max_items: 20
+min_items: 1
+categories:
+  - Beispielseite
+
+item_xpath: //article[contains(@class, 'news-item')]
+
+fields:
+  title:
+    xpath: .//h2[1]
+  link:
+    xpath: .//a[1]
+    attribute: href
+  date:
+    xpath: .//time[1]
+    attribute: datetime
+  summary:
+    xpath: .//*[contains(@class, 'summary')][1]
+  image:
+    xpath: .//img[1]
+    attribute: src
+
+date_formats:
+  - iso8601
+  # Alternativ zum Beispiel: "%d.%m.%Y"

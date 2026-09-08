@@ -1,0 +1,36 @@
+id: flieden-aktuelles
+name: Gemeinde Flieden – Aktuelles
+description: Aktuelle Neuigkeiten und Pressemitteilungen der Gemeinde Flieden.
+site_url: https://www.flieden.de/
+list_url: https://www.flieden.de/rathaus-politik/aktuelles/aktuelles-pressemitteilungen/
+language: de-DE
+timezone: Europe/Berlin
+cache_seconds: 3600
+max_items: 25
+min_items: 3
+categories:
+  - Gemeinde Flieden
+  - Pressemitteilung
+
+# Every matching element represents one feed item. XPath keeps each source
+# definition independent from the application code.
+item_xpath: //article[contains(concat(' ', normalize-space(@class), ' '), ' news-index-item ')]
+
+fields:
+  title:
+    xpath: .//*[contains(concat(' ', normalize-space(@class), ' '), ' headline ')][1]
+  link:
+    xpath: .//a[contains(concat(' ', normalize-space(@class), ' '), ' news-index__linked-headline-wrapper ')][1]
+    attribute: href
+  date:
+    xpath: .//time[@datetime][1]
+    attribute: datetime
+  summary:
+    xpath: .//*[contains(concat(' ', normalize-space(@class), ' '), ' article-teaser__teaser ')][1]
+    attribute: data-teasertext-full
+  image:
+    xpath: .//img[contains(concat(' ', normalize-space(@class), ' '), ' article-teaser__image ')][1]
+    attribute: src
+
+date_formats:
+  - iso8601
