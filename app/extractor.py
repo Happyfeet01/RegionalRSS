@@ -13,6 +13,7 @@ from .models import ExtractionError, FeedItem, FieldRule, SourceConfig
 
 
 WHITESPACE_RE = re.compile(r"\s+")
+LEADING_DATE_RE = re.compile(r"^\s*\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*")
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -37,6 +38,10 @@ def _extract_value(element: html.HtmlElement, rule: FieldRule, field_name: str) 
     if isinstance(match, etree._Element):
         if rule.attribute:
             value = match.get(rule.attribute)
+            # Dates are often text on older municipal sites even when newer cards
+            # use a machine-readable attribute.
+            if value is None and field_name == "date":
+                value = match.text_content()
         else:
             value = match.text_content()
     else:
@@ -141,6 +146,9 @@ def extract_items(page_html: str, source: SourceConfig) -> list[FeedItem]:
             published = _parse_date(date_value, source)
         except ExtractionError:
             continue
+        # Some CMS place the visible date inside the headline element. Keep the
+        # generated item title clean while retaining the machine-readable date.
+        title = LEADING_DATE_RE.sub("", title).strip() or title
         seen_urls.add(uri)
 
         items.append(
