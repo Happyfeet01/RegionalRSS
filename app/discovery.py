@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import re
 import json
+import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, replace
 from urllib.parse import urljoin, urlparse
 
@@ -20,6 +21,13 @@ FEED_TYPES = {
     "application/rdf+xml",
 }
 CLASS_TOKEN_RE = re.compile(r"(?:article|teaser|news|post|entry|card)", re.I)
+HEADING_XPATH = ".//*[self::h1 or self::h2 or self::h3 or self::h4]"
+DATE_CLASS_XPATH = (
+    ".//*[contains(translate(@class, "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'date') or "
+    "contains(translate(@class, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'datum') or "
+    "contains(translate(@class, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'time')]"
+)
 
 
 @dataclass(frozen=True)
@@ -123,38 +131,124 @@ def _class_xpath(tag: str, token: str) -> str:
     )
 
 
+def _exact_class_xpath(tag: str, classes: str) -> str | None:
+    classes = " ".join(classes.split())
+    if not classes or "'" in classes:
+        return None
+    return f"//{tag}[normalize-space(@class)='{classes}']"
+
+
+def _usable_container(element: html.HtmlElement) -> bool:
+    return bool(element.xpath(".//a[@href]")) and bool(element.xpath(HEADING_XPATH))
+
+
 def _candidate_xpaths(document: html.HtmlElement) -> list[str]:
     candidates = ["//article"]
     seen = set(candidates)
-    for element in document.xpath("//article[@class] | //li[@class] | //div[@class]"):
+    qualified = [
+        element
+        for element in document.xpath("//article | //li | //div | //section")
+        if isinstance(element, html.HtmlElement) and _usable_container(element)
+    ]
+
+    exact_counts = Counter(
+        (element.tag, " ".join((element.get("class") or "").split()))
+        for element in qualified
+        if element.get("class")
+    )
+    token_counts = Counter(
+        (element.tag, token)
+        for element in qualified
+        for token in (element.get("class") or "").split()
+        if len(token) >= 3
+    )
+
+    # Prefer a complete repeated class signature. This catches municipal CMS
+    # cards whose classes are generic instead of containing words like "news".
+    for (tag, classes), count in exact_counts.items():
+        if count < 2:
+            continue
+        xpath = _exact_class_xpath(tag, classes)
+        if xpath and xpath not in seen:
+            seen.add(xpath)
+            candidates.append(xpath)
+
+    # Keep the established news/card heuristics and also allow generic class
+    # tokens when at least two useful heading/link containers use them.
+    for element in qualified:
         for token in (element.get("class") or "").split():
-            if not CLASS_TOKEN_RE.search(token):
+            if not CLASS_TOKEN_RE.search(token) and token_counts[(element.tag, token)] < 2:
                 continue
             xpath = _class_xpath(element.tag, token)
             if xpath not in seen:
                 seen.add(xpath)
                 candidates.append(xpath)
+
+    # Last fallback: repeated direct siblings below an identifiable parent.
+    # This helps older municipal layouts without meaningful card class names.
+    for parent in document.xpath("//*[@id or @class]"):
+        child_groups: dict[str, list[html.HtmlElement]] = {}
+        for child in parent:
+            if (
+                isinstance(child, html.HtmlElement)
+                and child.tag in {"article", "li", "div", "section"}
+                and _usable_container(child)
+            ):
+                child_groups.setdefault(child.tag, []).append(child)
+        for child_tag, children in child_groups.items():
+            if len(children) < 2:
+                continue
+            parent_xpath = None
+            parent_id = (parent.get("id") or "").strip()
+            if parent_id and "'" not in parent_id:
+                parent_xpath = f"//*[@id='{parent_id}']"
+            elif parent.get("class"):
+                parent_xpath = _exact_class_xpath(parent.tag, parent.get("class") or "")
+            if parent_xpath:
+                xpath = f"{parent_xpath}/{child_tag}"
+                if xpath not in seen:
+                    seen.add(xpath)
+                    candidates.append(xpath)
     return candidates
 
 
 def _candidate_score(elements: list[html.HtmlElement]) -> float:
     if len(elements) < 2:
         return -1
+    sample = elements[:30]
     useful = 0
-    for element in elements[:30]:
-        has_link = bool(element.xpath(".//a[@href]"))
-        has_title = bool(element.xpath(".//*[self::h1 or self::h2 or self::h3 or self::h4]"))
-        has_date = bool(
-            element.xpath(
-                ".//time | .//*[contains(translate(@class, 'DATE', 'date'), 'date')]"
-            )
-        )
-        useful += int(has_link and has_title and has_date)
-    ratio = useful / min(len(elements), 30)
-    if useful < 2 or ratio < 0.55:
+    single_heading = 0
+    dated = 0
+    descriptive = 0
+    images = 0
+    for element in sample:
+        links = element.xpath(".//a[@href]")
+        headings = element.xpath(HEADING_XPATH)
+        if links and headings:
+            useful += 1
+        if len(headings) == 1:
+            single_heading += 1
+        if element.xpath(".//time | " + DATE_CLASS_XPATH):
+            dated += 1
+        if element.xpath(".//p"):
+            descriptive += 1
+        if element.xpath(".//img"):
+            images += 1
+    ratio = useful / len(sample)
+    if useful < 2 or ratio < 0.60:
         return -1
-    # Prefer a precise repeated component over a page-wide //article selector.
-    return useful * 10 + ratio * 20 - min(len(elements), 100) * 0.02
+
+    # A clean repeated card normally contains one headline and one useful link.
+    # Dates are a bonus, not a requirement: many municipal pages simply omit them.
+    return (
+        useful * 10
+        + ratio * 20
+        + single_heading * 3
+        + dated * 2
+        + descriptive * 0.5
+        + images * 0.25
+        - min(len(elements), 100) * 0.02
+    )
 
 
 def _detect_item_xpath(document: html.HtmlElement) -> str:
@@ -179,6 +273,31 @@ def _image_attribute(elements: list[html.HtmlElement]) -> str:
             if value and not value.startswith("data:"):
                 return attribute
     return "src"
+
+
+def _detect_date_rule(elements: list[html.HtmlElement]) -> dict[str, str] | None:
+    sample = elements[:10]
+    if not sample:
+        return None
+    rules = (
+        (".//time[1]", "datetime"),
+        (DATE_CLASS_XPATH + "[1]", ""),
+    )
+    minimum = min(2, len(sample))
+    for xpath, attribute in rules:
+        matches = 0
+        for element in sample:
+            try:
+                if element.xpath(xpath):
+                    matches += 1
+            except etree.XPathError:
+                break
+        if matches >= minimum:
+            rule = {"xpath": xpath}
+            if attribute:
+                rule["attribute"] = attribute
+            return rule
+    return None
 
 
 def analyze_page(page_html: str, page_url: str) -> DiscoveryResult:
@@ -208,6 +327,16 @@ def analyze_page(page_html: str, page_url: str) -> DiscoveryResult:
     item_xpath = _detect_item_xpath(document)
     elements = document.xpath(item_xpath)
     image_attribute = _image_attribute(elements)
+    fields: dict[str, dict[str, str]] = {
+        "title": {"xpath": ".//*[self::h1 or self::h2 or self::h3 or self::h4][1]"},
+        "link": {"xpath": ".//a[@href][1]", "attribute": "href"},
+        "summary": {"xpath": ".//p[1]"},
+        "image": {"xpath": ".//img[1]", "attribute": image_attribute},
+    }
+    date_rule = _detect_date_rule(elements)
+    if date_rule:
+        fields["date"] = date_rule
+
     raw = {
         "id": source_id,
         "name": title,
@@ -218,16 +347,7 @@ def analyze_page(page_html: str, page_url: str) -> DiscoveryResult:
         "max_items": 30,
         "min_items": 2,
         "item_xpath": item_xpath,
-        "fields": {
-            "title": {"xpath": ".//*[self::h1 or self::h2 or self::h3 or self::h4][1]"},
-            "link": {"xpath": ".//a[@href][1]", "attribute": "href"},
-            "date": {
-                "xpath": ".//time[1] | .//*[contains(translate(@class, 'DATE', 'date'), 'date')][1]",
-                "attribute": "datetime",
-            },
-            "summary": {"xpath": ".//p[1]"},
-            "image": {"xpath": ".//img[1]", "attribute": image_attribute},
-        },
+        "fields": fields,
         "date_formats": ["iso8601", "%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"],
     }
     source = parse_source(raw, "Automatische Erkennung")
