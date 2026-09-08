@@ -91,7 +91,9 @@ Die beim Test gefundenen Artikel werden als Vorschau angezeigt; Bilddateien
 werden auch dabei nicht gespeichert.
 
 Die Quellen liegen in einem eigenen Docker-Volume. Damit können sie von der UI
-geschrieben werden und bleiben bei Container-Updates erhalten.
+geschrieben werden und bleiben bei Container-Updates erhalten. Beim Start werden
+neue mitgelieferte Standardquellen nur ergänzt, wenn noch keine gleichnamige
+Datei im Volume existiert. Eigene oder bearbeitete Quellen werden nie überschrieben.
 
 ## Nutzerkonten und automatische Prüfung
 
