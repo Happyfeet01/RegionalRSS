@@ -70,6 +70,11 @@ REGIONALRSS_ADMIN_PASSWORD_HASH=scrypt.16384.8.1...
 REGIONALRSS_SESSION_SECRET=hier-steht-der-lange-zufällige-schlüssel
 ```
 
+Wichtig: Entweder müssen alle drei `REGIONALRSS_ADMIN_...`- beziehungsweise
+`REGIONALRSS_SESSION_SECRET`-Werte gesetzt sein oder alle drei leer bleiben.
+Eine nur teilweise eingerichtete Anmeldung wird aus Sicherheitsgründen nicht
+gestartet.
+
 Anschließend RegionalRSS neu erstellen und starten:
 
 ```bash
