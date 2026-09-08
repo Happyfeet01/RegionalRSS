@@ -15,7 +15,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=regionalrss:regionalrss app ./app
-COPY --chown=regionalrss:regionalrss sources ./sources
+COPY --chown=regionalrss:regionalrss sources ./default-sources
 COPY --chown=regionalrss:regionalrss scripts ./scripts
 COPY --chown=regionalrss:regionalrss wsgi.py ./wsgi.py
 
