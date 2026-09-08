@@ -10,6 +10,7 @@
 - `noindex, nofollow` per HTML, HTTP und `robots.txt`
 - fertige Quellenkonfiguration für die Pressemitteilungen der Gemeinde Neuhof
 - sichere Ergänzung neuer Standardquellen in bereits bestehende Docker-Volumes
+- fehlende HTML-Antwortfunktion für Login, Registrierung und persönliche Feeds ergänzt
 
 ## 0.2.0
 
