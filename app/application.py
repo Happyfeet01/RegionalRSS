@@ -167,6 +167,7 @@ class RegionalRssApplication:
             try:
                 return self._handle_admin(environ, start_response, method, path)
             except (ValueError, UnicodeDecodeError, AttributeError):
+                LOGGER.exception("Invalid admin request for %s", path)
                 return self._respond(
                     start_response,
                     "400 Bad Request",
@@ -181,6 +182,7 @@ class RegionalRssApplication:
             try:
                 return self._handle_account(environ, start_response, method, path)
             except (ValueError, UnicodeDecodeError, AttributeError):
+                LOGGER.exception("Invalid account request for %s", path)
                 return self._respond(
                     start_response,
                     "400 Bad Request",
@@ -1257,6 +1259,34 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
   </footer>
 </body>
 </html>"""
+
+    def _account_html(
+        self,
+        start_response: StartResponse,
+        method: str,
+        page: str,
+        *,
+        status: str = "200 OK",
+        extra_headers: list[tuple[str, str]] | None = None,
+    ) -> list[bytes]:
+        headers = [
+            ("Cache-Control", "no-store"),
+            (
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+        ]
+        if extra_headers:
+            headers.extend(extra_headers)
+        return self._respond(
+            start_response,
+            status,
+            page.encode("utf-8"),
+            method=method,
+            content_type="text/html; charset=utf-8",
+            extra_headers=headers,
+        )
 
     def _admin_html(
         self,
