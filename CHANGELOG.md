@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- Systemabsender und SMTP-Konfiguration über `.env`, STARTTLS oder direktes TLS
+- Pflicht-E-Mail-Adresse bei neuen Konten und Freischaltung nach Bestätigung
+- einmalige Bestätigungslinks mit 24 Stunden Gültigkeit, nur Hashes in SQLite
+- erneuter Versand nach Anmeldung mit CSRF-Schutz und Versandlimits
+- bestehende Konten und Quellen bleiben bei der Datenbankmigration erhalten
+- Registrierung bleibt ohne Mailkonfiguration gesperrt; bestehende Feeds und Adminzugang bleiben erreichbar
+- Gunicorn- und Nginx-Zugriffslogs ohne Query-Strings und Referer
+
 ## 0.3.0
 
 - URL-basierte automatische Erkennung über Admin- und Nutzeroberfläche

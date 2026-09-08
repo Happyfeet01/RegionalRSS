@@ -31,6 +31,7 @@ der Anzeige direkt von der Quellseite.
 - Schutz vor privaten beziehungsweise lokalen Zieladressen und unsicheren
   Weiterleitungen
 - Nutzerkonten mit persönlicher Feed-Verwaltung und einem konfigurierbaren Limit
+- E-Mail-Bestätigung für neue Konten, Systemabsender und SMTP über `.env`
 - öffentliche Feed-Übersicht unter `/`
 - geschützte Administrationsoberfläche zum Hinzufügen und Testen neuer Quellen
 - `noindex, nofollow` als HTML-Metadaten, HTTP-Header und `robots.txt`
@@ -118,6 +119,89 @@ mit Scrypt gehasht. Schreibende Aktionen sind durch signierte Cookies und
 CSRF-Token geschützt. Private und lokale Zieladressen bleiben gegen SSRF
 gesperrt. Für eine rein private Installation kann die Registrierung mit
 `REGIONALRSS_ALLOW_REGISTRATION=false` abgeschaltet werden.
+
+### Systemabsender und E-Mail-Bestätigung
+
+Neue Konten benötigen ab Version 0.4.0 eine eindeutige E-Mail-Adresse. Bis zur
+Bestätigung führt die Anmeldung zur Bestätigungsseite; eigene Feeds lassen sich
+erst danach anlegen und verwalten. Das öffentliche Feed-Verzeichnis bleibt ohne
+Anmeldung nutzbar. Nutzeradressen werden dort nicht angezeigt.
+
+In `.env` die SMTP-Daten deines Mailanbieters und einen dort erlaubten Absender
+eintragen. Die Anwendung legt **kein Postfach beim Mailanbieter** an.
+
+```dotenv
+REGIONALRSS_PUBLIC_BASE_URL=https://rss.dasnetzundich.de
+REGIONALRSS_ALLOW_REGISTRATION=true
+REGIONALRSS_MAIL_FROM=regionalrss@deine-domain.de
+REGIONALRSS_MAIL_FROM_NAME=RegionalRSS
+REGIONALRSS_SMTP_HOST=smtp.dein-mailanbieter.de
+REGIONALRSS_SMTP_PORT=587
+REGIONALRSS_SMTP_SECURITY=starttls
+REGIONALRSS_SMTP_USER=regionalrss@deine-domain.de
+REGIONALRSS_SMTP_PASSWORD='DEIN_SMTP_PASSWORT'
+```
+
+Für direktes TLS stattdessen `REGIONALRSS_SMTP_SECURITY=ssl` und den vom Anbieter
+genannten Port (üblicherweise 465) verwenden. Benutzername und Passwort dürfen
+beide leer bleiben, wenn der konfigurierte SMTP-Server keine Anmeldung verlangt.
+TLS-Zertifikate werden geprüft; eine unverschlüsselte Rückfallverbindung gibt es
+nicht. Das Passwort in einfachen Anführungszeichen schützt insbesondere `$` vor
+der Compose-Variablenersetzung.
+
+`REGIONALRSS_PUBLIC_BASE_URL` muss die öffentliche **HTTPS-Adresse** der Instanz
+ohne Unterpfad sein. Der Bestätigungslink wird ausschließlich aus dieser
+Konfiguration erzeugt. Ohne vollständige Mailkonfiguration nimmt die Anwendung
+keine neuen Registrierungen an und zeigt eine verständliche Meldung. Bestehende
+Feeds und der Adminzugang funktionieren weiter.
+
+Der Bestätigungslink gilt 24 Stunden. Erst ein Klick auf „E-Mail-Adresse
+bestätigen“ auf der geöffneten Seite verbraucht ihn; automatisches Öffnen durch
+Mailprogramme tut das nicht. Der Link bestätigt nur die Adresse und meldet kein
+Gerät automatisch an. In SQLite steht nur der SHA-256-Hash des zufälligen Tokens.
+Nach erfolgreicher Bestätigung werden alle Links dieses Kontos ungültig.
+
+Bei abgelaufenen Links oder Versandproblemen mit Benutzername und Passwort
+anmelden und „Bestätigungsmail erneut senden“ wählen. Mindestens eine Minute
+Abstand und höchstens fünf Versandversuche pro Stunde und Konto sind erlaubt.
+Vorherige, noch gültige Links bleiben bei erneutem Versand gültig, bis einer
+bestätigt wird. Schlägt SMTP fehl, bleibt das Konto vorgemerkt und kann denselben
+Ablauf später erneut versuchen. Fehler erscheinen ohne Adressen, Token oder
+Zugangsdaten im Container-Log. Die Registrierung ist zusätzlich auf zehn Versuche
+pro 15 Minuten und Verbindungspartner begrenzt. Hinter einem Reverse Proxy
+teilen Nutzer dieses Limit; clientseitige Forwarded-Header werden nicht vertraut.
+
+### Update von 0.3.x
+
+Vor dem Update `/data/accounts.sqlite3` zusammen mit den übrigen Anwendungsdaten
+sichern (bei einer Dateikopie den Container vorher anhalten). Dann die obigen
+Werte in `.env` ergänzen und neu bauen:
+
+```bash
+git pull --ff-only
+docker compose up -d --build
+docker compose logs --tail=100 regionalrss
+```
+
+Die SQLite-Migration läuft beim Start automatisch und erhält vorhandene Konten,
+Passwort-Hashes und Feed-Zuordnungen. Konten aus Version 0.3.x bleiben ohne
+nachträgliche Bestätigung nutzbar; neue Konten sind auch nach einem Neustart bis
+zur Bestätigung gesperrt. Der bestehende Administrator aus `.env` ist unabhängig
+von den registrierten Nutzerkonten.
+
+Die mitgelieferten Gunicorn- und Nginx-Zugriffslogformate lassen Query-Strings und
+Referer weg, damit Bestätigungstoken nicht im normalen Access-Log landen. Bei
+einer bestehenden Nginx-Konfiguration die `log_format regionalrss_safe`- und
+`access_log ... regionalrss_safe`-Zeilen aus `nginx/regionalrss.conf` übernehmen,
+im HTTPS-Server `Referrer-Policy no-referrer` setzen und mit `nginx -t` prüfen.
+Das gilt entsprechend für einen anders eingerichteten Reverse Proxy.
+
+Zum Prüfen nach dem Update mit einer eigenen E-Mail-Adresse registrieren, den
+Posteingang kontrollieren und den Link bestätigen. Die automatisierten Tests
+simulieren SMTP; sie prüfen nicht die Zustellung bei deinem Mailanbieter.
+
+Technische Grundlagen: [Python SMTP](https://docs.python.org/3/library/smtplib.html)
+und [OWASP zu Einmaltokens](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html).
 
 Die automatische Erkennung deckt übliche serverseitig ausgelieferte
 Meldungslisten ab. Bei ungewöhnlichem HTML kann der Administrator weiterhin die
@@ -277,8 +361,10 @@ Die Tests prüfen unter anderem:
 
 ## Datenschutz und Betrieb
 
-RegionalRSS speichert nur die ausgelesenen Feed-Metadaten und die Bild-URL als
-Text in SQLite. Es gibt keinen Bildproxy und kein Artikelarchiv. Vor einer
+RegionalRSS speichert Feed-Metadaten und die Bild-URL als Text in SQLite. Bei
+Nutzerkonten kommen Benutzername, E-Mail-Adresse, Passwort-Hash,
+Bestätigungsstatus und zeitlich begrenzte Token-Hashes hinzu. Es gibt keinen
+Bildproxy und kein Artikelarchiv. Vor einer
 öffentlichen Bereitstellung sollten Impressum und Datenschutzhinweise auf der
 Domain ergänzt sowie die jeweiligen Nutzungsbedingungen der Quellen geprüft
 werden.

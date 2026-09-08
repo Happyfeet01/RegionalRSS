@@ -3,12 +3,14 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 import unittest
-from urllib.parse import urlencode
+from unittest.mock import patch
+from urllib.parse import urlencode, urlsplit
 
 from app.application import RegionalRssApplication, Settings
 from app.auth import hash_password
 from app.config import load_source, parse_source
 from app.extractor import extract_items
+from app.mailer import MailSettings, VerificationMailer
 from app.service import ServiceResult
 
 
@@ -42,10 +44,12 @@ def call_app(
     payload = urlencode(form or {}).encode("utf-8")
     environ = {
         "REQUEST_METHOD": method,
-        "PATH_INFO": path,
+        "PATH_INFO": urlsplit(path).path,
+        "QUERY_STRING": urlsplit(path).query,
         "CONTENT_LENGTH": str(len(payload)),
         "CONTENT_TYPE": "application/x-www-form-urlencoded",
         "wsgi.input": BytesIO(payload),
+        "REMOTE_ADDR": "127.0.0.1",
     }
     if etag:
         environ["HTTP_IF_NONE_MATCH"] = etag
@@ -237,12 +241,17 @@ class AdminApplicationTest(unittest.TestCase):
         )
         self.assertEqual("403 Forbidden", status)
 
-    def test_registered_user_can_create_automatically_detected_feed(self) -> None:
+    @patch("app.mailer.VerificationMailer.send_verification")
+    def test_registered_user_can_create_automatically_detected_feed(self, send_mail) -> None:
         self.app.settings = Settings(
             **{
                 **self.app.settings.__dict__,
                 "allow_registration": True,
             }
+        )
+        self.app.mailer = VerificationMailer(
+            MailSettings(host="smtp.example.com", from_address="rss@example.com"),
+            self.app.settings.public_base_url,
         )
         status, _, body = call_app(self.app, "/login")
         self.assertEqual("200 OK", status)
@@ -256,6 +265,7 @@ class AdminApplicationTest(unittest.TestCase):
             method="POST",
             form={
                 "username": "tester",
+                "email": "tester@example.com",
                 "password": "a-secure-user-password",
                 "password_confirm": "a-secure-user-password",
             },
@@ -263,6 +273,14 @@ class AdminApplicationTest(unittest.TestCase):
         )
         self.assertEqual("303 See Other", status)
         cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, headers, _ = call_app(self.app, "/my-feeds", cookie=cookie)
+        self.assertEqual("303 See Other", status)
+        self.assertEqual("/verify-email", headers["Location"])
+        token = send_mail.call_args.args[1]
+        status, _, _ = call_app(
+            self.app, "/verify-email", method="POST", form={"token": token}
+        )
+        self.assertEqual("303 See Other", status)
         status, _, body = call_app(self.app, "/my-feeds", cookie=cookie)
         self.assertEqual("200 OK", status)
         self.assertIn(b"Meine Feeds", body)
