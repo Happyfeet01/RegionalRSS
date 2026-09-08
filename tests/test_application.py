@@ -107,6 +107,24 @@ class ApplicationTest(unittest.TestCase):
         self.assertEqual("304 Not Modified", status_304)
         self.assertEqual(b"", body_304)
 
+    def test_missing_packaged_sources_are_seeded_without_overwriting(self) -> None:
+        with TemporaryDirectory() as temporary:
+            source_dir = Path(temporary) / "mounted-sources"
+            settings = Settings(
+                sources_dir=source_dir,
+                cache_path=Path(temporary) / "cache.sqlite3",
+                public_base_url=None,
+                user_agent="RegionalRSS test",
+                timeout_seconds=2,
+                max_response_bytes=1024 * 1024,
+                allow_private_hosts=False,
+                site_title="RegionalRSS Test",
+                default_sources_dir=ROOT / "sources",
+            )
+            RegionalRssApplication(settings)
+            self.assertTrue((source_dir / "flieden-aktuelles.yml").is_file())
+            self.assertTrue((source_dir / "neuhof-pressemitteilungen.yml").is_file())
+
 
 class AdminApplicationTest(unittest.TestCase):
     @classmethod
