@@ -203,6 +203,41 @@ simulieren SMTP; sie prüfen nicht die Zustellung bei deinem Mailanbieter.
 Technische Grundlagen: [Python SMTP](https://docs.python.org/3/library/smtplib.html)
 und [OWASP zu Einmaltokens](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html).
 
+### Kontoeinstellungen und Kontenübersicht (ab 0.5.0)
+
+Die Navigation enthält jetzt direkt die Einstellungen. Die Oberflächen verwenden
+einheitlich das hellere Orange mit dunkler Beschriftung.
+
+| Bereich | Adresse | Inhalt |
+| --- | --- | --- |
+| Nutzer | `/settings` | Eigene E-Mail-Adresse, Bestätigungsstatus, Feedanzahl sowie E-Mail und Passwort ändern |
+| Admin | `/admin/accounts` | Registrierte Konten mit E-Mail-Adresse, Status, Feedanzahl und Registrierungsdatum |
+| Admin | `/admin/settings` | Aktuelle Serverkonfiguration, Systemabsender und SMTP-Konfiguration ohne Zugangsdaten |
+
+E-Mail- und Passwortänderungen benötigen das aktuelle Passwort. Eine neue
+E-Mail-Adresse wird vorgemerkt und erst nach Bestätigung übernommen. Eine bereits
+bestätigte Adresse und der Zugriff auf eigene Feeds bleiben bis dahin erhalten.
+Auch Bestandskonten ohne E-Mail können dort eine Adresse ergänzen. Noch nicht
+bestätigte neue Nutzer können eine falsch eingegebene Adresse korrigieren, bleiben
+aber bis zur Bestätigung für die Feedverwaltung gesperrt. Der erneute Mailversand
+nutzt dieselben Versandlimits wie die Registrierung.
+
+Eine Passwortänderung beendet andere bestehende Nutzersitzungen; das gerade
+verwendete Gerät erhält eine neue Sitzung. Nutzereinstellungen und die
+Admin-Kontenübersicht sind zugriffsgeschützt und werden nicht öffentlich gecacht.
+Adressen erscheinen weiterhin nicht im öffentlichen Feedverzeichnis.
+
+Das Administratorkonto aus `.env` ist ein eigenes Systemkonto. Es hat keine
+persönliche E-Mail-Adresse und ist in der Kontenübersicht separat gekennzeichnet.
+Ein zusätzlich registriertes Nutzerkonto hat sein eigenes Profil unter
+`/settings`. Ein gleicher Benutzername verleiht diesem Konto keine Adminrechte.
+Systemeinstellungen werden in der Adminoberfläche angezeigt und weiterhin in
+`.env` geändert; danach `docker compose up -d` ausführen.
+
+Beim Update auf 0.5.0 werden vorhandene Konten und noch gültige Bestätigungslinks
+automatisch migriert. Die Updatebefehle oben gelten weiterhin. Wegen der neuen
+Trennung von Admin- und Nutzersignaturen muss sich der Admin einmal neu anmelden.
+
 Die automatische Erkennung deckt übliche serverseitig ausgelieferte
 Meldungslisten ab. Bei ungewöhnlichem HTML kann der Administrator weiterhin die
 XPath-Expertenmaske verwenden. Seiten mit reiner JavaScript-Ausgabe oder

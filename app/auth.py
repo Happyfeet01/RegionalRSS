@@ -115,7 +115,7 @@ class SessionManager:
 
     def _sign(self, payload: str) -> str:
         digest = hmac.new(
-            self.secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+            self.secret.encode("utf-8"), ("admin|" + payload).encode("utf-8"), hashlib.sha256
         ).digest()
         return _encode(digest)
 
@@ -124,9 +124,9 @@ class SessionManager:
 class UserSessionManager:
     secret: str
 
-    def create_cookie(self, username: str, *, secure: bool) -> str:
+    def create_cookie(self, username: str, *, secure: bool, version: int = 0) -> str:
         expires = int(time.time()) + SESSION_SECONDS
-        payload = f"{username}|{expires}"
+        payload = f"{username}|{expires}|{version}"
         flags = [
             f"regionalrss_user_session={_encode(payload.encode('utf-8'))}.{self._sign(payload)}",
             "Path=/",
@@ -152,17 +152,28 @@ class UserSessionManager:
         return "; ".join(flags)
 
     def username(self, cookie_header: str) -> str | None:
+        session = self.read_session(cookie_header)
+        return session[0] if session else None
+
+    def read_session(self, cookie_header: str) -> tuple[str, int] | None:
         try:
             cookies = SimpleCookie(cookie_header)
             value = cookies["regionalrss_user_session"].value
             encoded_payload, signature = value.rsplit(".", 1)
             payload = _decode(encoded_payload).decode("utf-8")
-            username, expires_raw = payload.rsplit("|", 1)
+            parts = payload.split("|")
+            # Existing cookies have no version and remain valid until a password change.
+            if len(parts) == 2:
+                username, expires_raw = parts
+                version = 0
+            else:
+                username, expires_raw, raw_version = parts
+                version = int(raw_version)
             if int(expires_raw) < int(time.time()):
                 return None
             if not hmac.compare_digest(signature, self._sign(payload)):
                 return None
-            return username
+            return username, version
         except (KeyError, ValueError, UnicodeDecodeError):
             return None
 

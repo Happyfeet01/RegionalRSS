@@ -36,6 +36,23 @@ from .source_store import SourceStore
 LOGGER = logging.getLogger(__name__)
 FEED_PATH_RE = re.compile(r"^/feeds/([a-z0-9][a-z0-9-]{1,62}[a-z0-9])\.xml$")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
+ACCENT_COLOR = "#f5a04b"
+ACCENT_TEXT = "#33200c"
+SETTINGS_CSS = """
+a { color:inherit; }
+.settings-grid { display:grid; gap:1rem; }
+.panel { min-width:0; border:1px solid #8886; border-radius:12px; padding:1.2rem; }
+.details { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,2fr); gap:.6rem 1rem; }
+.details dt { font-weight:600; } .details dd { margin:0; overflow-wrap:anywhere; }
+.panel input { width:100%; min-width:0; } .panel form + form { margin-top:1rem; }
+.muted { opacity:.8; } .email { overflow-wrap:anywhere; }
+.table-wrap { overflow:auto; } table { border-collapse:collapse; width:100%; }
+th,td { text-align:left; vertical-align:top; border-bottom:1px solid #8886; padding:.7rem; }
+caption { text-align:left; margin-bottom:.8rem; font-weight:600; }
+td small { display:block; } a:focus-visible,button:focus-visible,input:focus-visible { outline:3px solid currentColor; outline-offset:3px; }
+@media(min-width:800px) { .settings-grid { grid-template-columns:1fr 1fr; } }
+@media(max-width:450px) { .details { grid-template-columns:1fr; } .details dd { margin-bottom:.5rem; } }
+"""
 
 
 @dataclass(frozen=True)
@@ -185,7 +202,7 @@ class RegionalRssApplication:
                     extra_headers=[("Cache-Control", "no-store")],
                 )
 
-        if path in {"/login", "/register", "/logout", "/my-feeds", "/verify-email", "/verify-email/resend"} or path.startswith(
+        if path in {"/login", "/register", "/logout", "/settings", "/my-feeds", "/verify-email", "/verify-email/resend"} or path.startswith(
             "/my-feeds/"
         ):
             try:
@@ -441,8 +458,10 @@ class RegionalRssApplication:
         if token is None:
             return "Für dieses Konto ist keine Bestätigung nötig.", "200 OK"
         try:
-            account = self.accounts.get(username)
-            self.mailer.send_verification(account.email, token)
+            recipient = self.accounts.verification_recipient(token)
+            if recipient is None:
+                return "Die Adresse wurde inzwischen geändert. Bitte eine neue Bestätigung anfordern.", "409 Conflict"
+            self.mailer.send_verification(recipient, token)
         except MailDeliveryError:
             # Keep the pending account for a password-authenticated retry; do not
             # silently activate it or leave an unsent token valid.
@@ -486,8 +505,9 @@ class RegionalRssApplication:
             ))
         if not username:
             return self._redirect(start_response, "/login")
-        if self.accounts.get(username).active:
-            return self._redirect(start_response, "/my-feeds")
+        account = self.accounts.get(username)
+        if account.active:
+            return self._redirect(start_response, "/settings" if account.pending_email else "/my-feeds")
         message = "Die Bestätigungsmail wurde versendet." if params.get("sent") == ["1"] else ""
         return self._account_html(start_response, method, self._verification_pending_page(username, message))
 
@@ -505,14 +525,13 @@ class RegionalRssApplication:
             <main class="narrow"><h1>Bitte bestätige deine E-Mail-Adresse</h1>
             <p>{html.escape(message)}</p>
             <p>Dein Konto ist vorgemerkt. Öffne den Bestätigungslink für
-            <strong>{html.escape(account.email or '')}</strong>, bevor du Feeds anlegst.</p>
+            <strong>{html.escape(account.verification_email or '')}</strong>, bevor du Feeds anlegst.</p>
             <p>Der Link gilt 24 Stunden. Bitte prüfe auch deinen Spamordner.</p>
             <form method="post" action="/verify-email/resend">
               <input type="hidden" name="csrf" value="{csrf}">
               <button type="submit">Bestätigungsmail erneut senden</button>
             </form><p>Erneuter Versand frühestens nach einer Minute.</p>
-            <form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}">
-              <button class="link" type="submit">Abmelden</button></form></main>''')
+            <p>Adresse falsch? In den <a href="/settings">Einstellungen</a> ändern.</p></main>''', username=username)
 
     def _handle_account(
         self,
@@ -529,8 +548,11 @@ class RegionalRssApplication:
                 method=method,
             )
 
-        username = self.user_sessions.username(environ.get("HTTP_COOKIE", ""))
+        session = self.user_sessions.read_session(environ.get("HTTP_COOKIE", ""))
+        username = session[0] if session else None
         account = self.accounts.get(username) if username else None
+        if account and account.session_version != session[1]:
+            account = None
         username = account.username if account else None
 
         if path == "/verify-email":
@@ -544,11 +566,13 @@ class RegionalRssApplication:
             form = self._read_form(environ)
             if not self.user_sessions.valid_csrf(username, self._form_value(form, "csrf")):
                 return self._forbidden(start_response, method)
-            if account.active:
+            if not account.verification_email:
                 return self._redirect(start_response, "/my-feeds")
             message, status = self._send_verification(username)
             return self._account_html(
-                start_response, method, self._verification_pending_page(username, message), status=status
+                start_response, method,
+                self._settings_page(username, message, error=status != "200 OK") if account.active
+                else self._verification_pending_page(username, message), status=status
             )
 
         if path == "/register":
@@ -604,7 +628,7 @@ class RegionalRssApplication:
                         (
                             "Set-Cookie",
                             self.user_sessions.create_cookie(
-                                signed_in.username, secure=self._is_https(environ)
+                                signed_in.username, secure=self._is_https(environ), version=signed_in.session_version
                             ),
                         )
                     ],
@@ -614,6 +638,9 @@ class RegionalRssApplication:
         if not username:
             return self._redirect(start_response, "/login")
         csrf = self.user_sessions.csrf_token(username)
+
+        if path == "/settings":
+            return self._handle_settings(environ, start_response, method, username)
 
         if path == "/logout":
             if method != "POST":
@@ -710,6 +737,54 @@ class RegionalRssApplication:
             start_response, "404 Not Found", b"Not found\n", method=method
         )
 
+    def _handle_settings(
+        self, environ: dict, start_response: StartResponse, method: str, username: str
+    ) -> list[bytes]:
+        if method == "GET":
+            return self._account_html(start_response, method, self._settings_page(username))
+        if method != "POST":
+            return self._method_not_allowed(start_response, method, "GET, POST")
+        form = self._read_form(environ)
+        if not self.user_sessions.valid_csrf(username, self._form_value(form, "csrf")):
+            return self._forbidden(start_response, method)
+        if not self.accounts.take_rate_limit(f"settings:{username.lower()}", limit=10, seconds=900):
+            return self._account_html(start_response, method, self._settings_page(
+                username, "Zu viele Änderungsversuche. Bitte in 15 Minuten erneut versuchen.", error=True
+            ), status="429 Too Many Requests")
+        headers = []
+        try:
+            stored_hash = self.accounts.password_hash(username)
+            if not stored_hash or not verify_password(self._form_value(form, "current_password"), stored_hash):
+                raise ValueError("Das aktuelle Passwort ist falsch.")
+            action = self._form_value(form, "action")
+            if action == "email":
+                if not self.mailer.configured:
+                    return self._account_html(start_response, method, self._settings_page(
+                        username, "Der E-Mail-Versand ist derzeit nicht eingerichtet. Bitte später erneut versuchen.", error=True
+                    ), status="503 Service Unavailable")
+                self.accounts.stage_email(username, self._form_value(form, "email"))
+                message, status = self._send_verification(username)
+            elif action == "password":
+                password = self._form_value(form, "new_password")
+                if password != self._form_value(form, "password_confirm"):
+                    raise ValueError("Die neuen Passwörter stimmen nicht überein.")
+                if not 12 <= len(password) <= 1024:
+                    raise ValueError("Das Passwort muss 12 bis 1024 Zeichen enthalten.")
+                if not self.accounts.change_password(username, stored_hash, hash_password(password)):
+                    raise ValueError("Das Passwort wurde inzwischen geändert. Bitte erneut anmelden.")
+                account = self.accounts.get(username)
+                headers.append(("Set-Cookie", self.user_sessions.create_cookie(
+                    username, secure=self._is_https(environ), version=account.session_version
+                )))
+                message, status = "Passwort geändert. Andere bestehende Anmeldungen wurden beendet.", "200 OK"
+            else:
+                raise ValueError("Unbekannte Einstellung.")
+        except ValueError as exc:
+            message, status = str(exc), "400 Bad Request"
+        return self._account_html(start_response, method, self._settings_page(
+            username, message, error=status != "200 OK"
+        ), status=status, extra_headers=headers)
+
     def _handle_admin(
         self,
         environ: dict,
@@ -764,6 +839,12 @@ class RegionalRssApplication:
 
         if not authenticated:
             return self._redirect(start_response, "/admin/login")
+
+        if path in {"/admin/accounts", "/admin/settings"}:
+            if method != "GET":
+                return self._method_not_allowed(start_response, method, "GET")
+            page = self._admin_accounts_page() if path == "/admin/accounts" else self._admin_settings_page()
+            return self._admin_html(start_response, method, page)
 
         if path == "/admin/logout":
             if method != "POST":
@@ -1050,6 +1131,102 @@ class RegionalRssApplication:
             </main>""",
         )
 
+    @staticmethod
+    def _email_status(account) -> str:
+        if account.email_verified_at is not None:
+            return "Bestätigt"
+        if not account.verification_required:
+            return "Bestandskonto – ohne Bestätigung nutzbar"
+        return "Bestätigung ausstehend"
+
+    def _settings_page(self, username: str, message: str = "", *, error: bool = False) -> str:
+        account = self.accounts.get(username)
+        csrf = html.escape(self.user_sessions.csrf_token(username), quote=True)
+        notice = f'<p class="message {"error" if error else "success"}" role="status">{html.escape(message)}</p>' if message else ""
+        pending = ""
+        if account.pending_email:
+            pending = f'<p>Neue Adresse wartet auf Bestätigung: <strong class="email">{html.escape(account.pending_email)}</strong>.</p>'
+            if account.email_verified_at is not None:
+                pending += '<p>Bis dahin bleibt deine bisherige E-Mail-Adresse gültig.</p>'
+        resend = ""
+        if account.verification_email:
+            resend = f'''<form method="post" action="/verify-email/resend">
+                <input type="hidden" name="csrf" value="{csrf}">
+                <button type="submit">Bestätigungsmail erneut senden</button>
+                <small>Der Link gilt 24 Stunden. Erneuter Versand nach frühestens einer Minute.</small>
+            </form>'''
+        return self._account_layout("Einstellungen", f'''
+            <main><h1>Einstellungen</h1><p>Dein Konto und deine Zugangsdaten.</p>{notice}
+            <div class="settings-grid">
+              <section class="panel"><h2>Mein Konto</h2><dl class="details">
+                <dt>Benutzername</dt><dd>{html.escape(account.username)}</dd>
+                <dt>E-Mail-Adresse</dt><dd>{html.escape(account.email or 'Noch keine E-Mail-Adresse hinterlegt')}</dd>
+                <dt>E-Mail-Status</dt><dd>{self._email_status(account)}</dd>
+                <dt>Eigene Feeds</dt><dd>{len(self.accounts.source_ids(username))} von {self.settings.max_sources_per_user}</dd>
+              </dl>{pending}{resend}</section>
+              <section class="panel"><h2>E-Mail-Adresse ändern</h2>
+                <p>Die neue Adresse wird erst nach der Bestätigung übernommen.</p>
+                <form method="post" action="/settings">
+                  <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="email">
+                  <label>Neue E-Mail-Adresse<input type="email" name="email" maxlength="254" autocomplete="email" required></label>
+                  <label>Aktuelles Passwort<input type="password" name="current_password" autocomplete="current-password" required></label>
+                  <button type="submit">Bestätigung an neue Adresse senden</button>
+                </form></section>
+              <section class="panel"><h2>Passwort ändern</h2>
+                <form method="post" action="/settings">
+                  <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="password">
+                  <label>Aktuelles Passwort<input type="password" name="current_password" autocomplete="current-password" required></label>
+                  <label>Neues Passwort<small>12 bis 1024 Zeichen</small><input type="password" name="new_password" minlength="12" maxlength="1024" autocomplete="new-password" required></label>
+                  <label>Neues Passwort wiederholen<input type="password" name="password_confirm" minlength="12" maxlength="1024" autocomplete="new-password" required></label>
+                  <button type="submit">Passwort speichern</button>
+                </form></section>
+            </div></main>''', username=username)
+
+    def _admin_accounts_page(self) -> str:
+        accounts = self.accounts.list_accounts()
+        rows = []
+        for account, feed_count in accounts:
+            pending = f'<small>Neue Adresse: {html.escape(account.pending_email)} (unbestätigt)</small>' if account.pending_email else ""
+            created = datetime.fromtimestamp(account.created_at, UTC).strftime("%d.%m.%Y")
+            rows.append(f'''<tr><th scope="row">{html.escape(account.username)}</th>
+                <td class="email">{html.escape(account.email or 'Nicht hinterlegt')}{pending}</td>
+                <td>{self._email_status(account)}</td><td>{feed_count}</td><td>{created}</td></tr>''')
+        table = f'''<div class="table-wrap"><table><caption>{len(accounts)} registrierte Nutzerkonten</caption>
+            <thead><tr><th scope="col">Benutzername</th><th scope="col">E-Mail-Adresse</th>
+            <th scope="col">E-Mail-Status</th><th scope="col">Feeds</th><th scope="col">Registriert am</th></tr></thead>
+            <tbody>{''.join(rows)}</tbody></table></div>''' if accounts else '<p>Noch keine Nutzerkonten registriert.</p>'
+        return self._admin_layout("Konten", f'''<main><h1>Konten</h1>
+            <p>Registrierte Nutzer, ihre E-Mail-Bestätigung und die Anzahl ihrer Feeds.</p>
+            <section class="panel"><h2>Administrator: {html.escape(self.settings.admin_username or '')}</h2>
+              <p>Dieses Administratorkonto wird über die Serverkonfiguration eingerichtet und gehört nicht zu den registrierten Nutzerkonten.</p>
+              <a href="/admin/settings">Systemeinstellungen ansehen</a></section>
+            {table}</main>''')
+
+    def _admin_settings_page(self) -> str:
+        mail = self.settings.mail
+        values = [
+            ("Administrator", self.settings.admin_username or "Nicht eingerichtet"),
+            ("Seitentitel", self.settings.site_title),
+            ("Öffentliche Adresse", self.settings.public_base_url or "Nicht festgelegt"),
+            ("Registrierung", "Aktiv" if self.settings.allow_registration and self.mailer.configured else
+             "Mailkonfiguration fehlt" if self.settings.allow_registration else "Deaktiviert"),
+            ("Feeds pro Nutzer", str(self.settings.max_sources_per_user)),
+            ("Systemabsender", mail.from_address or "Nicht eingerichtet"),
+            ("Absendername", mail.from_name),
+            ("SMTP-Server", mail.host or "Nicht eingerichtet"),
+            ("SMTP-Port", str(mail.port)),
+            ("SMTP-Verschlüsselung", mail.security.upper()),
+            ("Mailkonfiguration", "Vollständig – Zustellung beim Anbieter separat prüfen" if self.mailer.configured else "Unvollständig oder ungültig"),
+        ]
+        details = ''.join(f'<dt>{html.escape(label)}</dt><dd>{html.escape(value)}</dd>' for label, value in values)
+        return self._admin_layout("Systemeinstellungen", f'''<main><h1>Systemeinstellungen</h1>
+            <p>Aktuelle Konfiguration dieser RegionalRSS-Instanz.</p>
+            <section class="panel"><dl class="details">{details}</dl></section>
+            <p>Diese Werte werden auf dem Server in der <code>.env</code> gepflegt.
+            Nach Änderungen den Container mit <code>docker compose up -d</code> neu erstellen.</p>
+            <p>Der Systemabsender verschickt Bestätigungsmails. Er ist keine persönliche E-Mail-Adresse des Administrators.</p>
+            <p><a href="/settings">Einstellungen eines zusätzlich registrierten Nutzerkontos öffnen</a></p></main>''')
+
     def _my_feeds_page(self, username: str, query_string: str = "") -> str:
         assert self.user_sessions is not None
         source_ids = self.accounts.source_ids(username)
@@ -1088,9 +1265,9 @@ class RegionalRssApplication:
         return self._account_layout(
             "Meine Feeds",
             f"""
-            <nav><a href="/">Öffentliche Feeds</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="link">Abmelden</button></form></nav>
             <main><div class="title-row"><div><h1>Meine Feeds</h1><p>Angemeldet als {html.escape(username)}</p></div><a class="button" href="/my-feeds/new">Webseite hinzufügen</a></div>
             {message}{empty}<section class="source-list">{''.join(cards)}</section></main>""",
+            username=username,
         )
 
     def _new_feed_page(
@@ -1102,7 +1279,6 @@ class RegionalRssApplication:
         return self._account_layout(
             "Webseite hinzufügen",
             f"""
-            <nav><a href="/">Öffentliche Feeds</a><a href="/my-feeds">Meine Feeds</a></nav>
             <main class="narrow"><h1>Webseite hinzufügen</h1>
               <p>RegionalRSS sucht zuerst nach einem vorhandenen RSS- oder Atom-Feed. Falls keiner vorhanden ist, wird die Meldungsliste automatisch erkannt.</p>{message}
               <form method="post" action="/my-feeds/create">
@@ -1112,24 +1288,33 @@ class RegionalRssApplication:
                 <button type="submit">Prüfen und Feed anlegen</button>
               </form>
             </main>""",
+            username=username,
         )
 
-    def _account_layout(self, title: str, body: str) -> str:
+    def _account_layout(self, title: str, body: str, *, username: str | None = None) -> str:
+        navigation = ""
+        if username and self.user_sessions:
+            csrf = html.escape(self.user_sessions.csrf_token(username), quote=True)
+            navigation = f'''<nav aria-label="Kontonavigation"><a href="/">Öffentliche Feeds</a>
+                <a href="/my-feeds">Meine Feeds</a><a href="/settings">Einstellungen</a>
+                <form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}">
+                <button class="link" type="submit">Abmelden</button></form></nav>'''
         return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow">
 <title>{html.escape(title)} – RegionalRSS</title><style>
-:root {{ color-scheme:light dark; font-family:system-ui,sans-serif; --accent:#e06b20; }}
+:root {{ color-scheme:light dark; font-family:system-ui,sans-serif; --accent:{ACCENT_COLOR}; }}
 * {{ box-sizing:border-box; }} body {{ max-width:960px; margin:auto; padding:1.5rem; line-height:1.5; }}
 nav,.title-row,.actions {{ display:flex; align-items:center; gap:.8rem; flex-wrap:wrap; }} nav {{ justify-content:flex-end; margin-bottom:2rem; }} nav form {{ margin:0; }}
 .title-row {{ justify-content:space-between; }} h1,h2,p {{ margin-top:0; }} form {{ display:grid; gap:1rem; }}
 label {{ display:grid; gap:.35rem; font-weight:600; }} small {{ font-weight:400; opacity:.75; }} input {{ padding:.75rem; border:1px solid #8888; border-radius:8px; font:inherit; }}
-button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:var(--accent); color:#fff; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; }}
-button.link {{ background:none; color:inherit; padding:0; text-decoration:underline; }} .danger {{ background:#b42318; }}
+button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:var(--accent); color:{ACCENT_TEXT}; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; }}
+button.link {{ background:none; color:inherit; padding:0; text-decoration:underline; }} .danger {{ background:#b42318; color:white; }}
 .narrow {{ max-width:520px; margin:6vh auto; }} .source-list {{ display:grid; gap:1rem; }} .source-card {{ border:1px solid #8886; border-radius:12px; padding:1rem; display:flex; justify-content:space-between; gap:1rem; align-items:center; }}
 .source-card form {{ display:block; }} .badge {{ font-size:.8rem; opacity:.8; }} code {{ overflow-wrap:anywhere; }}
 .message {{ padding:1rem; border-radius:10px; }} .error {{ background:#b4231822; border:1px solid #b42318; }} .success {{ background:#16803c22; border:1px solid #16803c; }}
 @media(max-width:699px) {{ .source-card {{ align-items:flex-start; flex-direction:column; }} }}
-</style></head><body>{body}</body></html>"""
+{SETTINGS_CSS}
+</style></head><body>{navigation}{body}</body></html>"""
 
     def _admin_index_page(self, error: str | None = None) -> str:
         assert self.sessions is not None
@@ -1307,7 +1492,8 @@ button.link {{ background:none; color:inherit; padding:0; text-decoration:underl
         if show_navigation and self.sessions is not None:
             csrf = html.escape(self.sessions.csrf_token(), quote=True)
             navigation = f"""
-            <nav><a href="/">Öffentliche Feeds</a><a href="/admin">Quellen</a>
+            <nav aria-label="Administration"><a href="/">Öffentliche Feeds</a><a href="/admin">Quellen</a>
+              <a href="/admin/accounts">Konten</a><a href="/admin/settings">Einstellungen</a>
               <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="link" type="submit">Abmelden</button></form>
             </nav>
             """
@@ -1315,14 +1501,14 @@ button.link {{ background:none; color:inherit; padding:0; text-decoration:underl
 <html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow">
 <title>{html.escape(title)} – RegionalRSS</title>
 <style>
-:root {{ color-scheme: light dark; font-family: system-ui, sans-serif; --accent:#e06b20; }}
+:root {{ color-scheme: light dark; font-family: system-ui, sans-serif; --accent:{ACCENT_COLOR}; }}
 * {{ box-sizing:border-box; }} body {{ max-width:1050px; margin:auto; padding:1.5rem; line-height:1.5; }}
 nav,.title-row,.actions {{ display:flex; gap:.8rem; align-items:center; flex-wrap:wrap; }} nav {{ justify-content:flex-end; margin-bottom:2rem; }} nav form {{ margin:0; }}
 .title-row {{ justify-content:space-between; margin-bottom:1.5rem; }} h1,h2,p {{ margin-top:0; }}
 form {{ display:grid; gap:1rem; }} fieldset {{ border:1px solid #8886; border-radius:12px; padding:1rem; display:grid; gap:1rem; }} legend {{ font-weight:700; padding:0 .4rem; }}
 label {{ display:grid; gap:.35rem; font-weight:600; }} small {{ font-weight:400; opacity:.75; }} input,textarea {{ width:100%; padding:.7rem; border:1px solid #8888; border-radius:7px; font:inherit; }}
-button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:var(--accent); color:white; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; }}
-.secondary {{ background:#667085; }} .danger {{ background:#b42318; }} button.link {{ background:none; color:inherit; padding:0; text-decoration:underline; }}
+button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:var(--accent); color:{ACCENT_TEXT}; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; }}
+.secondary {{ background:#667085; color:white; }} .danger {{ background:#b42318; color:white; }} button.link {{ background:none; color:inherit; padding:0; text-decoration:underline; }}
 .grid {{ display:grid; gap:1rem; }} .source-list {{ display:grid; gap:1rem; }} .source-card {{ border:1px solid #8886; border-radius:12px; padding:1rem; display:flex; justify-content:space-between; gap:1rem; align-items:center; }} .source-card form {{ display:block; }}
 .message,.preview {{ padding:1rem; border-radius:10px; }} .error {{ background:#b4231822; border:1px solid #b42318; }} .preview {{ background:#16803c22; border:1px solid #16803c; margin-bottom:1rem; }}
 .rule-grid {{ display:grid; grid-template-columns:minmax(100px,.6fr) minmax(220px,2fr) minmax(100px,.7fr); gap:.6rem; align-items:center; }}
@@ -1330,6 +1516,7 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
 .quick-add {{ padding:1rem; border:1px solid #8886; border-radius:12px; margin-bottom:1rem; }} .inline {{ display:flex; gap:.6rem; }} .inline input {{ flex:1; }}
 @media (min-width:700px) {{ .grid.two {{ grid-template-columns:1fr 1fr; }} .grid.three {{ grid-template-columns:repeat(3,1fr); }} }}
 @media (max-width:699px) {{ .source-card {{ align-items:flex-start; flex-direction:column; }} .rule-grid {{ grid-template-columns:1fr; }} .rule-grid > strong {{ display:none; }} }}
+{SETTINGS_CSS}
 </style></head><body>{navigation}{body}</body></html>"""
 
     def _index_page(self) -> str:
@@ -1357,10 +1544,10 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
         cards_html = "".join(cards)
         title = html.escape(self.settings.site_title)
         admin_link = (
-            '<a href="/admin">Quellen verwalten</a>' if self.sessions is not None else ""
+            '<a href="/admin">Administration</a>' if self.sessions is not None else ""
         )
         account_link = (
-            '<a href="/my-feeds">Eigene Feeds verwalten</a>'
+            '<a href="/my-feeds">Meine Feeds</a><a href="/settings">Einstellungen</a>'
             if self.user_sessions is not None
             else ""
         )
@@ -1381,20 +1568,20 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
     article h2 {{ margin-top: 0; }}
     .actions {{ display: flex; flex-wrap: wrap; gap: .8rem; margin: 1rem 0; }}
     a {{ color: inherit; }}
-    a.feed {{ background: #e06b20; color: white; padding: .55rem .8rem; border-radius: 8px; text-decoration: none; }}
+    a.feed {{ background: {ACCENT_COLOR}; color: {ACCENT_TEXT}; padding: .55rem .8rem; border-radius: 8px; text-decoration: none; }}
     code {{ overflow-wrap: anywhere; }}
     footer {{ margin-top: 2.5rem; font-size: .9rem; opacity: .75; }}
   </style>
 </head>
 <body>
   <header>
+    <nav class="actions" aria-label="Hauptnavigation">{account_link} {admin_link}</nav>
     <h1>{title}</h1>
     <p>RSS-Feeds für Webseiten, die selbst keinen passenden Feed anbieten.</p>
   </header>
   <main>{cards_html}</main>
   <footer>
     Bilder werden nicht gespeichert oder weiterverteilt. Der RSS-Client lädt sie bei Bedarf direkt von der jeweiligen Originalseite.
-    {admin_link} {account_link}
   </footer>
 </body>
 </html>"""
