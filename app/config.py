@@ -11,8 +11,8 @@ from .models import ConfigurationError, FieldRule, SourceConfig
 
 
 SOURCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
-REQUIRED_FIELDS = ("title", "link", "date")
-OPTIONAL_FIELDS = ("summary", "image")
+REQUIRED_FIELDS = ("title", "link")
+OPTIONAL_FIELDS = ("date", "summary", "image")
 
 
 def _require_text(data: dict, key: str, context: str) -> str:

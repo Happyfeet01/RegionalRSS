@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0
+
+- automatische Erkennung für Meldungslisten ohne sichtbares Veröffentlichungsdatum erweitert
+- wiederkehrende generische Inhaltsblöcke auch ohne typische Klassen wie `news`, `card` oder `article` erkennen
+- Veröffentlichungsdatum im erzeugten Feed optional; ohne Datum wird kein `pubDate` ausgegeben
+- verständlichere Experteneinstellungen mit Erklärungen statt technischer Kurzbegriffe
+- öffentliche Datenschutzerklärung unter `/datenschutz` mit konfigurierbaren Betreiberangaben
+- Gunicorn- und Nginx-Access-Logs ohne Client-IP, Query-Strings oder Referer
+- Nutzer können ihr Konto mit aktuellem Passwort und zusätzlicher Bestätigung vollständig löschen
+- beim Löschen eines Kontos werden auch seine Feed-Zuordnungen, Bestätigungstoken und eigenen Feed-Konfigurationen entfernt
+- Administratoren können registrierte Nutzerkonten samt zugehörigen Feeds löschen
+- Datenschutzlink auf öffentlichen, Nutzer- und Administrationsseiten
+
 ## 0.5.0
 
 - hellere orangefarbene Schaltflächen auf öffentlichen, Nutzer- und Adminseiten

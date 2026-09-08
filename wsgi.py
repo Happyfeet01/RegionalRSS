@@ -1,8 +1,8 @@
 import logging
 import os
 
-from app.application import create_application
+from app.webapp import create_web_application
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-application = create_application()
+application = create_web_application()
