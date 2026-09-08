@@ -294,3 +294,28 @@ class AccountStore:
                 (username,),
             ).fetchall()
         return [str(row[0]) for row in rows]
+
+    def delete_account(self, username: str) -> list[str]:
+        """Delete one account and return its owned source IDs.
+
+        Foreign-key cascades remove feed ownership and verification tokens. Rate-limit
+        keys that directly contain the username are removed explicitly. Registration
+        rate-limit keys are pseudonymous peer hashes and expire independently.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT source_id FROM source_owners WHERE username = ? ORDER BY created_at DESC",
+                (username,),
+            ).fetchall()
+            deleted = connection.execute(
+                "DELETE FROM accounts WHERE username = ?", (username,)
+            ).rowcount
+            if not deleted:
+                return []
+            normalized = username.lower()
+            connection.execute(
+                "DELETE FROM account_rate_limits WHERE key IN (?, ?)",
+                (f"verification:{normalized}", f"settings:{normalized}"),
+            )
+        return [str(row[0]) for row in rows]
