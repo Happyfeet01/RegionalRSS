@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -116,7 +116,11 @@ def extract_items(page_html: str, source: SourceConfig) -> list[FeedItem]:
         try:
             title = _extract_value(element, source.fields["title"], "title")
             link = _extract_value(element, source.fields["link"], "link")
-            date_value = _extract_value(element, source.fields["date"], "date")
+            date_value = (
+                _extract_value(element, source.fields["date"], "date")
+                if "date" in source.fields
+                else None
+            )
             summary = (
                 _extract_value(element, source.fields["summary"], "summary")
                 if "summary" in source.fields
@@ -131,7 +135,7 @@ def extract_items(page_html: str, source: SourceConfig) -> list[FeedItem]:
             # A single malformed card must not break an otherwise healthy feed.
             continue
 
-        assert title is not None and link is not None and date_value is not None
+        assert title is not None and link is not None
         uri = _absolute_http_url(link, source.list_url, "link")
         try:
             image_url = _absolute_http_url(image, source.list_url, "image")
@@ -142,10 +146,14 @@ def extract_items(page_html: str, source: SourceConfig) -> list[FeedItem]:
         if uri in seen_urls:
             continue
 
-        try:
-            published = _parse_date(date_value, source)
-        except ExtractionError:
-            continue
+        published: datetime | None = None
+        if date_value:
+            try:
+                published = _parse_date(date_value, source)
+            except ExtractionError:
+                # Dates are useful metadata, but an otherwise valid article should
+                # not disappear merely because a site omits or changes its date.
+                published = None
         # Some CMS place the visible date inside the headline element. Keep the
         # generated item title clean while retaining the machine-readable date.
         title = LEADING_DATE_RE.sub("", title).strip() or title
@@ -170,5 +178,6 @@ def extract_items(page_html: str, source: SourceConfig) -> list[FeedItem]:
             f"Only {len(items)} valid item(s) found; expected at least {source.min_items}"
         )
 
-    items.sort(key=lambda item: item.published, reverse=True)
+    fallback = datetime.min.replace(tzinfo=UTC)
+    items.sort(key=lambda item: item.published or fallback, reverse=True)
     return items
