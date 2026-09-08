@@ -40,6 +40,8 @@ class SourceConfig:
     fields: dict[str, FieldRule]
     date_formats: tuple[str, ...]
     categories: tuple[str, ...]
+    source_type: str = "scrape"
+    native_feed_url: str | None = None
 
 
 @dataclass(frozen=True)
