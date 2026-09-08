@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 from app.application import RegionalRssApplication, Settings
 from app.auth import hash_password
-from app.config import load_source
+from app.config import load_source, parse_source
 from app.extractor import extract_items
 from app.service import ServiceResult
 
@@ -88,6 +88,8 @@ class ApplicationTest(unittest.TestCase):
         self.assertEqual("200 OK", status)
         self.assertEqual("text/html; charset=utf-8", headers["Content-Type"])
         self.assertIn(b"flieden-aktuelles.xml", body)
+        self.assertIn(b'noindex,nofollow', body)
+        self.assertEqual("noindex, nofollow", headers["X-Robots-Tag"])
 
     def test_feed_endpoint_and_conditional_request(self) -> None:
         status, headers, body = call_app(
@@ -216,6 +218,54 @@ class AdminApplicationTest(unittest.TestCase):
             cookie=cookie,
         )
         self.assertEqual("403 Forbidden", status)
+
+    def test_registered_user_can_create_automatically_detected_feed(self) -> None:
+        self.app.settings = Settings(
+            **{
+                **self.app.settings.__dict__,
+                "allow_registration": True,
+            }
+        )
+        status, headers, _ = call_app(
+            self.app,
+            "/register",
+            method="POST",
+            form={
+                "username": "tester",
+                "password": "a-secure-user-password",
+                "password_confirm": "a-secure-user-password",
+            },
+            forwarded_proto="https",
+        )
+        self.assertEqual("303 See Other", status)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        source = parse_source(
+            {
+                "id": "auto-example",
+                "name": "Automatisch",
+                "description": "Automatisch erkannt",
+                "site_url": "https://example.com/",
+                "list_url": "https://example.com/news/",
+                "source_type": "native",
+                "native_feed_url": "https://example.com/feed.xml",
+            }
+        )
+        self.app._discover_source = lambda _url: (source, [])
+        csrf = self.app.user_sessions.csrf_token("tester")
+        status, headers, _ = call_app(
+            self.app,
+            "/my-feeds/create",
+            method="POST",
+            form={"csrf": csrf, "url": "https://example.com/news/", "name": ""},
+            cookie=cookie,
+        )
+        self.assertEqual("303 See Other", status)
+        self.assertEqual("tester", self.app.accounts.owner("auto-example"))
+        self.assertTrue((self.app.settings.sources_dir / "auto-example.yml").is_file())
+
+        status, headers, _ = call_app(self.app, "/feeds/auto-example.xml")
+        self.assertEqual("307 Temporary Redirect", status)
+        self.assertEqual("https://example.com/feed.xml", headers["Location"])
 
 
 if __name__ == "__main__":
