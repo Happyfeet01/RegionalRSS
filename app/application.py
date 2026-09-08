@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +53,7 @@ class Settings:
     allow_registration: bool = False
     max_sources_per_user: int = 20
     accounts_path: Path | None = None
+    default_sources_dir: Path | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -99,6 +101,11 @@ class Settings:
             max_sources_per_user=int(
                 os.getenv("REGIONALRSS_MAX_SOURCES_PER_USER", "20")
             ),
+            default_sources_dir=(
+                Path(os.environ["REGIONALRSS_DEFAULT_SOURCES_DIR"])
+                if os.getenv("REGIONALRSS_DEFAULT_SOURCES_DIR")
+                else None
+            ),
         )
 
 
@@ -108,6 +115,7 @@ StartResponse = Callable[[str, list[tuple[str, str]]], Callable]
 class RegionalRssApplication:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._seed_default_sources()
         self.source_store = SourceStore(settings.sources_dir)
         self.sources = self.source_store.all()
         self.cache = FeedCache(settings.cache_path)
@@ -141,6 +149,16 @@ class RegionalRssApplication:
         self.user_sessions = (
             UserSessionManager(settings.session_secret) if settings.session_secret else None
         )
+
+    def _seed_default_sources(self) -> None:
+        defaults = self.settings.default_sources_dir
+        if defaults is None or not defaults.is_dir():
+            return
+        self.settings.sources_dir.mkdir(parents=True, exist_ok=True)
+        for source_path in sorted((*defaults.glob("*.yml"), *defaults.glob("*.yaml"))):
+            target = self.settings.sources_dir / source_path.name
+            if not target.exists():
+                shutil.copyfile(source_path, target)
 
     def __call__(self, environ: dict, start_response: StartResponse) -> Iterable[bytes]:
         method = environ.get("REQUEST_METHOD", "GET").upper()
