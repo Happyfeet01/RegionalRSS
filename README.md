@@ -4,13 +4,14 @@ RegionalRSS erzeugt RSS-2.0-Feeds für Webseiten, die selbst keinen passenden
 Feed anbieten. Die Anwendung ist nicht auf Flieden beschränkt: Jede unterstützte
 Webseite liegt als kleine YAML-Quellenkonfiguration im Ordner `sources/`.
 
-Der erste enthaltene Feed ist:
+Enthaltene Beispiel-Feeds sind:
 
 ```text
 /feeds/flieden-aktuelles.xml
+/feeds/neuhof-pressemitteilungen.xml
 ```
 
-Er enthält Überschrift, Veröffentlichungszeit, Anreißer, Kategorien, Link zum
+Sie enthalten Überschrift, Veröffentlichungszeit, Anreißer, Kategorien, Link zum
 Original und die originale Artikelbild-URL. Bilddateien werden von RegionalRSS
 weder heruntergeladen noch gespeichert. Der RSS-Client lädt ein Bild erst bei
 der Anzeige direkt von der Quellseite.
@@ -18,7 +19,9 @@ der Anzeige direkt von der Quellseite.
 ## Eigenschaften
 
 - RSS 2.0 mit `content:encoded`, `media:content` und `media:thumbnail`
-- beliebig viele freigeschaltete Quellen über YAML-Dateien
+- automatische Erkennung bereits vorhandener RSS-, Atom- und JSON-Feeds
+- automatische Ableitung von Regeln für übliche HTML-Meldungslisten
+- beliebig viele freigeschaltete Quellen über die Oberfläche oder YAML-Dateien
 - stabile Artikel-GUIDs auf Basis der Original-URL
 - SQLite-Cache: Eine Quellseite wird unabhängig von der Zahl der Abonnenten nur
   im festgelegten Intervall abgerufen
@@ -27,9 +30,10 @@ der Anzeige direkt von der Quellseite.
   verfügbar
 - Schutz vor privaten beziehungsweise lokalen Zieladressen und unsicheren
   Weiterleitungen
-- kein öffentliches Feld für beliebige URLs
-- kleine öffentliche Feed-Übersicht unter `/`
+- Nutzerkonten mit persönlicher Feed-Verwaltung und einem konfigurierbaren Limit
+- öffentliche Feed-Übersicht unter `/`
 - geschützte Administrationsoberfläche zum Hinzufügen und Testen neuer Quellen
+- `noindex, nofollow` als HTML-Metadaten, HTTP-Header und `robots.txt`
 - Gesundheitsprüfung unter `/healthz`
 
 ## Schnellstart mit Docker
@@ -51,9 +55,8 @@ http://127.0.0.1:8787/feeds/flieden-aktuelles.xml
 
 ## Administrationskonto einrichten
 
-Die öffentlichen Feeds benötigen weiterhin keine Anmeldung. Nur das Hinzufügen,
-Bearbeiten und Löschen von Webseiten unter `/admin` ist geschützt. Es gibt
-bewusst keine öffentliche Registrierung.
+Die öffentlichen Feeds benötigen weiterhin keine Anmeldung. Das zentrale
+Hinzufügen, Bearbeiten und Löschen von Webseiten unter `/admin` ist geschützt.
 
 Zuerst Passwort-Hash und Sitzungsschlüssel erzeugen:
 
@@ -89,6 +92,35 @@ werden auch dabei nicht gespeichert.
 
 Die Quellen liegen in einem eigenen Docker-Volume. Damit können sie von der UI
 geschrieben werden und bleiben bei Container-Updates erhalten.
+
+## Nutzerkonten und automatische Prüfung
+
+Wenn `REGIONALRSS_SESSION_SECRET` gesetzt ist, steht zusätzlich die Anmeldung
+unter `/login` bereit. Die öffentliche Registrierung wird über `.env` gesteuert:
+
+```dotenv
+REGIONALRSS_ALLOW_REGISTRATION=true
+REGIONALRSS_MAX_SOURCES_PER_USER=20
+```
+
+Unter `/my-feeds` trägt ein Nutzer nur noch die Seite mit den Meldungen ein.
+RegionalRSS lädt deren HTML und arbeitet anschließend in dieser Reihenfolge:
+
+1. Im HTML angekündigten RSS-, Atom- oder JSON-Feed finden und validieren.
+2. Wenn kein Feed vorhanden ist, wiederkehrende Artikelkarten, Überschrift,
+   Link, Datum, Kurztext und Original-Bild-URL erkennen.
+3. Die Quelle dem Nutzerkonto zuordnen und öffentlich auf der Startseite listen.
+
+Die Konten und Zuordnungen liegen in `/data/accounts.sqlite3`. Passwörter werden
+mit Scrypt gehasht. Schreibende Aktionen sind durch signierte Cookies und
+CSRF-Token geschützt. Private und lokale Zieladressen bleiben gegen SSRF
+gesperrt. Für eine rein private Installation kann die Registrierung mit
+`REGIONALRSS_ALLOW_REGISTRATION=false` abgeschaltet werden.
+
+Die automatische Erkennung deckt übliche serverseitig ausgelieferte
+Meldungslisten ab. Bei ungewöhnlichem HTML kann der Administrator weiterhin die
+XPath-Expertenmaske verwenden. Seiten mit reiner JavaScript-Ausgabe oder
+Bot-Prüfung lassen sich dadurch nicht automatisch erschließen.
 
 ## Mit Nginx veröffentlichen
 
@@ -147,7 +179,7 @@ weil RSS-Clients diese nicht lösen können. Der Traefik-Aufbau enthält stattde
 ein einfaches Rate-Limit; die Anwendung selbst reduziert Quellabrufe durch ihren
 Cache.
 
-## Weitere Webseiten hinzufügen
+## Weitere Webseiten manuell hinzufügen
 
 1. `sources/_template.yml.example` unter einem neuen Namen kopieren, zum
    Beispiel `sources/osthessen-beispiel.yml`.
@@ -167,6 +199,14 @@ Cache.
 Der neue Feed ist dann automatisch unter
 `/feeds/<id>.xml` auf der Übersichtsseite vorhanden. Es muss kein Python-Code
 angepasst werden.
+
+## Suchmaschinen ausschließen
+
+Die öffentliche Übersicht soll von Menschen und RSS-Clients verwendet, aber
+nicht in Suchmaschinen aufgenommen werden. RegionalRSS setzt deshalb auf allen
+Antworten `X-Robots-Tag: noindex, nofollow`, ergänzt das entsprechende
+HTML-Metafeld und liefert eine `robots.txt` mit `Disallow: /`. Die mitgelieferte
+Nginx-Konfiguration setzt denselben Header zusätzlich am Reverse Proxy.
 
 ### Aufbau einer Quelle
 
