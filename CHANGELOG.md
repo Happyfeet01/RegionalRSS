@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- hellere orangefarbene Schaltflächen auf öffentlichen, Nutzer- und Adminseiten
+- sichtbare Navigation zu Nutzereinstellungen, Admin-Kontenübersicht und Systemeinstellungen
+- eigene E-Mail-Adresse und Bestätigungsstatus anzeigen; Änderungen mit aktuellem Passwort bestätigen
+- neue E-Mail-Adresse erst nach Bestätigung übernehmen; bestehende Adresse bis dahin erhalten
+- Passwortänderung mit Beendigung älterer Nutzersitzungen
+- Adminübersicht mit Benutzernamen, E-Mail-Adressen, Bestätigungsstatus und Feedanzahl
+- Systemeinstellungen ohne Anzeige von Passwörtern oder Sitzungsschlüsseln
+- getrennte Signaturen für Admin- und Nutzersitzungen; Admin nach dem Update einmal neu anmelden
+
 ## 0.4.0
 
 - Systemabsender und SMTP-Konfiguration über `.env`, STARTTLS oder direktes TLS

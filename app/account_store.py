@@ -21,10 +21,17 @@ class Account:
     email: str | None
     email_verified_at: int | None
     verification_required: bool
+    pending_email: str | None = None
+    created_at: int = 0
+    session_version: int = 0
 
     @property
     def active(self) -> bool:
         return not self.verification_required or self.email_verified_at is not None
+
+    @property
+    def verification_email(self) -> str | None:
+        return self.pending_email or (self.email if not self.active else None)
 
 
 class VerificationThrottled(ValueError):
@@ -61,10 +68,13 @@ class AccountStore:
                 # Only pre-existing accounts are grandfathered. New INSERTs set 1.
                 ("verification_required", "INTEGER NOT NULL DEFAULT 0"),
                 ("verification_sent_at", "INTEGER"),
+                ("pending_email", "TEXT COLLATE NOCASE"),
+                ("session_version", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
             connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_email ON accounts(email COLLATE NOCASE)")
+            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_pending_email ON accounts(pending_email COLLATE NOCASE)")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS source_owners (
                     source_id TEXT PRIMARY KEY,
@@ -79,6 +89,11 @@ class AccountStore:
                     expires_at INTEGER NOT NULL,
                     FOREIGN KEY(username) REFERENCES accounts(username) ON DELETE CASCADE
                 )""")
+            verification_columns = {row[1] for row in connection.execute("PRAGMA table_info(email_verifications)")}
+            if "email" not in verification_columns:
+                connection.execute("ALTER TABLE email_verifications ADD COLUMN email TEXT COLLATE NOCASE")
+                # Preserve outstanding confirmation links from version 0.4.0.
+                connection.execute("UPDATE email_verifications SET email = (SELECT email FROM accounts WHERE accounts.username = email_verifications.username)")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS account_rate_limits (
                     key TEXT PRIMARY KEY,
@@ -90,6 +105,9 @@ class AccountStore:
         email = normalize_email(email)
         try:
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute("SELECT 1 FROM accounts WHERE pending_email = ?", (email,)).fetchone():
+                    return False
                 connection.execute(
                     "INSERT INTO accounts(username, password_hash, created_at, email, verification_required) VALUES (?, ?, ?, ?, 1)",
                     (username, password_hash, int(time.time()), email),
@@ -101,10 +119,46 @@ class AccountStore:
     def get(self, username: str) -> Account | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT username, email, email_verified_at, verification_required FROM accounts WHERE username = ?",
+                "SELECT username, email, email_verified_at, verification_required, pending_email, created_at, session_version FROM accounts WHERE username = ?",
                 (username,),
             ).fetchone()
-        return Account(row[0], row[1], row[2], bool(row[3])) if row else None
+        return Account(*row) if row else None
+
+    def list_accounts(self) -> list[tuple[Account, int]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT a.username, a.email, a.email_verified_at, a.verification_required, "
+                "a.pending_email, a.created_at, a.session_version, "
+                "(SELECT count(*) FROM source_owners o WHERE o.username = a.username) "
+                "FROM accounts a ORDER BY a.username COLLATE NOCASE"
+            ).fetchall()
+        return [(Account(*row[:7]), row[7]) for row in rows]
+
+    def stage_email(self, username: str, email: str) -> None:
+        email = normalize_email(email)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT email, pending_email FROM accounts WHERE username = ?", (username,)).fetchone()
+            if row is None:
+                raise ValueError("Das Konto wurde nicht gefunden.")
+            if email in row:
+                raise ValueError("Diese Adresse ist bereits hinterlegt. Bei Bedarf die Bestätigungsmail erneut senden.")
+            if connection.execute(
+                "SELECT 1 FROM accounts WHERE username != ? AND (email = ? OR pending_email = ?)",
+                (username, email, email),
+            ).fetchone():
+                raise ValueError("Diese E-Mail-Adresse ist bereits vergeben.")
+            # Keep the current address and activation status until confirmation.
+            connection.execute("UPDATE accounts SET pending_email = ? WHERE username = ?", (email, username))
+            connection.execute("DELETE FROM email_verifications WHERE username = ?", (username,))
+
+    def change_password(self, username: str, expected_hash: str, new_hash: str) -> bool:
+        with self._connect() as connection:
+            return bool(connection.execute(
+                "UPDATE accounts SET password_hash = ?, session_version = session_version + 1 "
+                "WHERE username = ? AND password_hash = ?",
+                (new_hash, username, expected_hash),
+            ).rowcount)
 
     def take_rate_limit(self, key: str, *, limit: int, seconds: int) -> bool:
         now = int(time.time())
@@ -130,17 +184,20 @@ class AccountStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT email, email_verified_at, verification_required, verification_sent_at FROM accounts WHERE username = ?",
+                "SELECT email, email_verified_at, verification_required, verification_sent_at, pending_email FROM accounts WHERE username = ?",
                 (username,),
             ).fetchone()
-            if row is None or not row[0] or row[1] is not None or not row[2]:
+            if row is None:
+                return None
+            target = row[4] or (row[0] if row[1] is None and row[2] else None)
+            if not target:
                 return None
             if row[3] is not None and row[3] > now - RESEND_SECONDS:
                 raise VerificationThrottled("Bitte warte eine Minute vor dem erneuten Versand.")
             connection.execute("DELETE FROM email_verifications WHERE expires_at <= ?", (now,))
             connection.execute(
-                "INSERT INTO email_verifications VALUES (?, ?, ?)",
-                (hashlib.sha256(token.encode()).hexdigest(), username, now + VERIFICATION_SECONDS),
+                "INSERT INTO email_verifications(token_hash, username, expires_at, email) VALUES (?, ?, ?, ?)",
+                (hashlib.sha256(token.encode()).hexdigest(), username, now + VERIFICATION_SECONDS, target),
             )
             connection.execute("UPDATE accounts SET verification_sent_at = ? WHERE username = ?", (now, username))
         return token
@@ -149,13 +206,22 @@ class AccountStore:
         with self._connect() as connection:
             connection.execute("DELETE FROM email_verifications WHERE token_hash = ?", (hashlib.sha256(token.encode()).hexdigest(),))
 
+    def verification_recipient(self, token: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT email FROM email_verifications WHERE token_hash = ?",
+                (hashlib.sha256(token.encode()).hexdigest(),),
+            ).fetchone()
+        return row[0] if row else None
+
     def verification_valid(self, token: str) -> bool:
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
             return False
         with self._connect() as connection:
             return connection.execute(
                 "SELECT 1 FROM email_verifications v JOIN accounts a ON a.username = v.username "
-                "WHERE token_hash = ? AND expires_at > ? AND a.email_verified_at IS NULL AND a.verification_required = 1",
+                "WHERE token_hash = ? AND expires_at > ? AND v.email = COALESCE(a.pending_email, a.email) "
+                "AND (a.pending_email IS NOT NULL OR (a.email_verified_at IS NULL AND a.verification_required = 1))",
                 (hashlib.sha256(token.encode()).hexdigest(), int(time.time())),
             ).fetchone() is not None
 
@@ -166,14 +232,16 @@ class AccountStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT username FROM email_verifications WHERE token_hash = ? AND expires_at > ?",
+                "SELECT username, email FROM email_verifications WHERE token_hash = ? AND expires_at > ?",
                 (hashlib.sha256(token.encode()).hexdigest(), now),
             ).fetchone()
             if row is None:
                 return False
             updated = connection.execute(
-                "UPDATE accounts SET email_verified_at = ? WHERE username = ? AND email_verified_at IS NULL AND verification_required = 1",
-                (now, row[0]),
+                "UPDATE accounts SET email = ?, pending_email = NULL, email_verified_at = ?, verification_required = 1 "
+                "WHERE username = ? AND COALESCE(pending_email, email) = ? "
+                "AND (pending_email IS NOT NULL OR (email_verified_at IS NULL AND verification_required = 1))",
+                (row[1], now, row[0], row[1]),
             ).rowcount
             connection.execute("DELETE FROM email_verifications WHERE username = ?", (row[0],))
         return bool(updated)
