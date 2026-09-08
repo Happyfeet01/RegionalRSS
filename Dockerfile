@@ -25,5 +25,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
 
-# Omit query strings and referrers so email verification tokens stay out of access logs.
-CMD ["gunicorn", "--bind=0.0.0.0:8080", "--workers=2", "--threads=4", "--timeout=30", "--access-logfile=-", "--access-logformat=%(h)s %(t)s %(m)s %(U)s %(s)s %(b)s", "--error-logfile=-", "wsgi:application"]
+# Datenschutz: keine Client-IP, Query-Strings oder Referer im Access-Log.
+CMD ["gunicorn", "--bind=0.0.0.0:8080", "--workers=2", "--threads=4", "--timeout=30", "--access-logfile=-", "--access-logformat=%(t)s %(m)s %(U)s %(s)s %(b)s", "--error-logfile=-", "wsgi:application"]
