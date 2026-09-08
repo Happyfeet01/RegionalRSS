@@ -13,7 +13,8 @@ services:
       REGIONALRSS_PUBLIC_BASE_URL: ${REGIONALRSS_PUBLIC_BASE_URL:-}
       REGIONALRSS_USER_AGENT: ${REGIONALRSS_USER_AGENT:-RegionalRSS/0.2}
       REGIONALRSS_SITE_TITLE: ${REGIONALRSS_SITE_TITLE:-RegionalRSS}
-      REGIONALRSS_SOURCES_DIR: /app/sources
+      REGIONALRSS_SOURCES_DIR: /data/sources
+      REGIONALRSS_DEFAULT_SOURCES_DIR: /app/default-sources
       REGIONALRSS_CACHE_PATH: /data/cache.sqlite3
       REGIONALRSS_ACCOUNTS_PATH: /data/accounts.sqlite3
       REGIONALRSS_TIMEOUT_SECONDS: ${REGIONALRSS_TIMEOUT_SECONDS:-12}
@@ -26,7 +27,7 @@ services:
       REGIONALRSS_MAX_SOURCES_PER_USER: ${REGIONALRSS_MAX_SOURCES_PER_USER:-20}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - regionalrss_sources:/app/sources
+      - regionalrss_sources:/data/sources
       - regionalrss_data:/data
     tmpfs:
       - /tmp:size=32m,mode=1777
