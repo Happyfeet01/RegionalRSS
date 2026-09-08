@@ -1,0 +1,30 @@
+id: neuhof-pressemitteilungen
+name: Gemeinde Neuhof – Pressemitteilungen
+description: Aktuelle Pressemitteilungen der Gemeinde Neuhof im Landkreis Fulda.
+site_url: https://www.neuhof-fulda.de/
+list_url: https://www.neuhof-fulda.de/buergerservice-politik/rathaus/aktuelle-pressemitteilungen/
+language: de-DE
+timezone: Europe/Berlin
+cache_seconds: 1800
+max_items: 30
+min_items: 2
+item_xpath: //article[contains(concat(' ', normalize-space(@class), ' '), ' news-index-item ')]
+fields:
+  title:
+    xpath: .//*[self::h2 or self::h3 or self::h4][1]
+  link:
+    xpath: .//a[@href][1]
+    attribute: href
+  date:
+    xpath: .//time[@datetime][1]
+    attribute: datetime
+  summary:
+    xpath: .//p[contains(concat(' ', normalize-space(@class), ' '), ' article-teaser__teaser ')][1]
+  image:
+    xpath: .//img[@data-src][1]
+    attribute: data-src
+date_formats:
+  - iso8601
+categories:
+  - Neuhof
+  - Gemeinde
