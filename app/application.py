@@ -7,15 +7,17 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Iterable
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
-from .auth import SessionManager, verify_password
+from .account_store import AccountStore
+from .auth import SessionManager, UserSessionManager, hash_password, verify_password
 from .cache import FeedCache
 from .config import parse_source
+from .discovery import analyze_page, validate_feed_document
 from .extractor import extract_items
 from .feed import build_rss
 from .fetcher import FetchError, fetch_html
@@ -31,6 +33,7 @@ from .source_store import SourceStore
 
 LOGGER = logging.getLogger(__name__)
 FEED_PATH_RE = re.compile(r"^/feeds/([a-z0-9][a-z0-9-]{1,62}[a-z0-9])\.xml$")
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,9 @@ class Settings:
     admin_username: str | None = None
     admin_password_hash: str | None = None
     session_secret: str | None = None
+    allow_registration: bool = False
+    max_sources_per_user: int = 20
+    accounts_path: Path | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -58,6 +64,12 @@ class Settings:
             cache_path=Path(
                 os.getenv(
                     "REGIONALRSS_CACHE_PATH", str(project_root / "data" / "cache.sqlite3")
+                )
+            ),
+            accounts_path=Path(
+                os.getenv(
+                    "REGIONALRSS_ACCOUNTS_PATH",
+                    str(project_root / "data" / "accounts.sqlite3"),
                 )
             ),
             public_base_url=public_base_url or None,
@@ -80,6 +92,13 @@ class Settings:
             ).strip()
             or None,
             session_secret=os.getenv("REGIONALRSS_SESSION_SECRET", "").strip() or None,
+            allow_registration=os.getenv(
+                "REGIONALRSS_ALLOW_REGISTRATION", "false"
+            ).lower()
+            in {"1", "true", "yes"},
+            max_sources_per_user=int(
+                os.getenv("REGIONALRSS_MAX_SOURCES_PER_USER", "20")
+            ),
         )
 
 
@@ -116,6 +135,12 @@ class RegionalRssApplication:
             if settings.admin_username and settings.session_secret
             else None
         )
+        self.accounts = AccountStore(
+            settings.accounts_path or settings.cache_path.with_name("accounts.sqlite3")
+        )
+        self.user_sessions = (
+            UserSessionManager(settings.session_secret) if settings.session_secret else None
+        )
 
     def __call__(self, environ: dict, start_response: StartResponse) -> Iterable[bytes]:
         method = environ.get("REQUEST_METHOD", "GET").upper()
@@ -123,6 +148,20 @@ class RegionalRssApplication:
         if path == "/admin" or path.startswith("/admin/"):
             try:
                 return self._handle_admin(environ, start_response, method, path)
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                return self._respond(
+                    start_response,
+                    "400 Bad Request",
+                    b"Invalid form data\n",
+                    method=method,
+                    extra_headers=[("Cache-Control", "no-store")],
+                )
+
+        if path in {"/login", "/register", "/logout", "/my-feeds"} or path.startswith(
+            "/my-feeds/"
+        ):
+            try:
+                return self._handle_account(environ, start_response, method, path)
             except (ValueError, UnicodeDecodeError, AttributeError):
                 return self._respond(
                     start_response,
@@ -142,6 +181,16 @@ class RegionalRssApplication:
             )
 
         self._refresh_sources()
+
+        if path == "/robots.txt":
+            return self._respond(
+                start_response,
+                "200 OK",
+                b"User-agent: *\nDisallow: /\n",
+                method=method,
+                content_type="text/plain; charset=utf-8",
+                extra_headers=[("Cache-Control", "public, max-age=86400")],
+            )
 
         if path == "/":
             body = self._index_page().encode("utf-8")
@@ -189,6 +238,11 @@ class RegionalRssApplication:
                 "404 Not Found",
                 b"Unknown feed\n",
                 method=method,
+            )
+
+        if source.source_type == "native" and source.native_feed_url:
+            return self._native_feed_redirect(
+                start_response, source.native_feed_url, method=method
             )
 
         try:
@@ -250,6 +304,253 @@ class RegionalRssApplication:
             self.sources = self.source_store.all()
         except ConfigurationError:
             LOGGER.exception("Unable to reload source definitions")
+
+    def _discover_source(self, url: str) -> tuple[SourceConfig, list]:
+        if len(url) > 2048:
+            raise ConfigurationError("Die URL ist zu lang.")
+        response = fetch_html(
+            url,
+            user_agent=self.settings.user_agent,
+            timeout_seconds=self.settings.timeout_seconds,
+            max_response_bytes=self.settings.max_response_bytes,
+            allow_private_hosts=self.settings.allow_private_hosts,
+        )
+        if response.body is None:
+            raise FetchError("Die Webseite hat keinen HTML-Inhalt geliefert.")
+        result = analyze_page(response.body, response.final_url)
+        if result.native and result.source.native_feed_url:
+            feed_response = fetch_html(
+                result.source.native_feed_url,
+                user_agent=self.settings.user_agent,
+                timeout_seconds=self.settings.timeout_seconds,
+                max_response_bytes=self.settings.max_response_bytes,
+                allow_private_hosts=self.settings.allow_private_hosts,
+                accepted_content_types={
+                    "application/rss+xml",
+                    "application/atom+xml",
+                    "application/feed+json",
+                    "application/rdf+xml",
+                    "application/xml",
+                    "text/xml",
+                    "text/plain",
+                    "text/html",
+                },
+                accept_header="application/rss+xml, application/atom+xml, application/feed+json, application/xml;q=0.9, text/xml;q=0.8",
+            )
+            if feed_response.body is None:
+                raise FetchError("Der gefundene Feed ist leer.")
+            validate_feed_document(feed_response.body)
+        source_id = result.source.source_id
+        suffix = 2
+        while source_id in self.sources:
+            ending = f"-{suffix}"
+            source_id = f"{result.source.source_id[:64-len(ending)].rstrip('-')}{ending}"
+            suffix += 1
+        return replace(result.source, source_id=source_id), result.items
+
+    def _handle_account(
+        self,
+        environ: dict,
+        start_response: StartResponse,
+        method: str,
+        path: str,
+    ) -> list[bytes]:
+        if self.user_sessions is None:
+            return self._respond(
+                start_response,
+                "404 Not Found",
+                b"User accounts are not configured\n",
+                method=method,
+            )
+
+        username = self.user_sessions.username(environ.get("HTTP_COOKIE", ""))
+        if username and not self.accounts.exists(username):
+            username = None
+
+        if path == "/register":
+            if not self.settings.allow_registration:
+                return self._account_html(
+                    start_response,
+                    method,
+                    self._account_login_page(
+                        "Die Registrierung ist auf diesem Server deaktiviert."
+                    ),
+                    status="403 Forbidden",
+                )
+            if method == "GET":
+                if username:
+                    return self._redirect(start_response, "/my-feeds")
+                return self._account_html(
+                    start_response, method, self._account_register_page()
+                )
+            if method == "POST":
+                form = self._read_form(environ)
+                requested = self._form_value(form, "username").strip()
+                password = self._form_value(form, "password")
+                confirmation = self._form_value(form, "password_confirm")
+                if not USERNAME_RE.fullmatch(requested):
+                    error = "Der Benutzername muss 3–32 Zeichen lang sein."
+                elif password != confirmation:
+                    error = "Die Passwörter stimmen nicht überein."
+                else:
+                    try:
+                        encoded = hash_password(password)
+                    except ValueError:
+                        error = "Das Passwort muss mindestens 12 Zeichen enthalten."
+                    else:
+                        if not self.accounts.create(requested, encoded):
+                            error = "Dieser Benutzername ist bereits vergeben."
+                        else:
+                            return self._redirect(
+                                start_response,
+                                "/my-feeds",
+                                extra_headers=[
+                                    (
+                                        "Set-Cookie",
+                                        self.user_sessions.create_cookie(
+                                            requested, secure=self._is_https(environ)
+                                        ),
+                                    )
+                                ],
+                            )
+                return self._account_html(
+                    start_response,
+                    method,
+                    self._account_register_page(error, requested),
+                    status="400 Bad Request",
+                )
+            return self._method_not_allowed(start_response, method, "GET, POST")
+
+        if path == "/login":
+            if method == "GET":
+                if username:
+                    return self._redirect(start_response, "/my-feeds")
+                return self._account_html(
+                    start_response, method, self._account_login_page()
+                )
+            if method == "POST":
+                form = self._read_form(environ)
+                requested = self._form_value(form, "username").strip()
+                stored_hash = self.accounts.password_hash(requested)
+                valid = bool(stored_hash) and verify_password(
+                    self._form_value(form, "password"), stored_hash or ""
+                )
+                if not valid:
+                    return self._account_html(
+                        start_response,
+                        method,
+                        self._account_login_page(
+                            "Benutzername oder Passwort ist falsch.", requested
+                        ),
+                        status="401 Unauthorized",
+                    )
+                return self._redirect(
+                    start_response,
+                    "/my-feeds",
+                    extra_headers=[
+                        (
+                            "Set-Cookie",
+                            self.user_sessions.create_cookie(
+                                requested, secure=self._is_https(environ)
+                            ),
+                        )
+                    ],
+                )
+            return self._method_not_allowed(start_response, method, "GET, POST")
+
+        if not username:
+            return self._redirect(start_response, "/login")
+        csrf = self.user_sessions.csrf_token(username)
+
+        if path == "/logout":
+            if method != "POST":
+                return self._method_not_allowed(start_response, method, "POST")
+            form = self._read_form(environ)
+            if not self.user_sessions.valid_csrf(username, self._form_value(form, "csrf")):
+                return self._forbidden(start_response, method)
+            return self._redirect(
+                start_response,
+                "/",
+                extra_headers=[
+                    (
+                        "Set-Cookie",
+                        self.user_sessions.clear_cookie(secure=self._is_https(environ)),
+                    )
+                ],
+            )
+
+        self._refresh_sources()
+        if path == "/my-feeds":
+            if method != "GET":
+                return self._method_not_allowed(start_response, method, "GET")
+            return self._account_html(
+                start_response,
+                method,
+                self._my_feeds_page(username, environ.get("QUERY_STRING", "")),
+            )
+        if path == "/my-feeds/new":
+            if method != "GET":
+                return self._method_not_allowed(start_response, method, "GET")
+            return self._account_html(
+                start_response, method, self._new_feed_page(username)
+            )
+        if path == "/my-feeds/create":
+            if method != "POST":
+                return self._method_not_allowed(start_response, method, "POST")
+            form = self._read_form(environ)
+            if not self.user_sessions.valid_csrf(username, self._form_value(form, "csrf")):
+                return self._forbidden(start_response, method)
+            if len(self.accounts.source_ids(username)) >= self.settings.max_sources_per_user:
+                return self._account_html(
+                    start_response,
+                    method,
+                    self._new_feed_page(
+                        username,
+                        f"Du kannst höchstens {self.settings.max_sources_per_user} Feeds anlegen.",
+                    ),
+                    status="400 Bad Request",
+                )
+            url = self._form_value(form, "url").strip()
+            try:
+                source, _ = self._discover_source(url)
+                custom_name = self._form_value(form, "name").strip()
+                if custom_name:
+                    source = replace(source, name=custom_name[:160])
+                self.source_store.save(source)
+                if not self.accounts.claim(source.source_id, username):
+                    self.source_store.delete(source.source_id)
+                    raise ConfigurationError("Der Feed konnte keinem Konto zugeordnet werden.")
+                self._refresh_sources()
+            except (FetchError, ExtractionError, ConfigurationError, OSError) as exc:
+                return self._account_html(
+                    start_response,
+                    method,
+                    self._new_feed_page(username, f"Prüfung fehlgeschlagen: {exc}", url),
+                    status="400 Bad Request",
+                )
+            kind = "native" if source.source_type == "native" else "generated"
+            return self._redirect(start_response, f"/my-feeds?created={kind}")
+
+        delete_match = re.fullmatch(
+            r"/my-feeds/([a-z0-9][a-z0-9-]{1,62}[a-z0-9])/delete", path
+        )
+        if delete_match:
+            if method != "POST":
+                return self._method_not_allowed(start_response, method, "POST")
+            form = self._read_form(environ)
+            if not self.user_sessions.valid_csrf(username, self._form_value(form, "csrf")):
+                return self._forbidden(start_response, method)
+            source_id = delete_match.group(1)
+            if self.accounts.owner(source_id) != username:
+                return self._forbidden(start_response, method)
+            self.source_store.delete(source_id)
+            self.accounts.release(source_id, username)
+            self._refresh_sources()
+            return self._redirect(start_response, "/my-feeds?deleted=1")
+
+        return self._respond(
+            start_response, "404 Not Found", b"Not found\n", method=method
+        )
 
     def _handle_admin(
         self,
@@ -336,6 +637,26 @@ class RegionalRssApplication:
                 start_response, method, self._source_form_page(None)
             )
 
+        if path == "/admin/sources/auto":
+            if method != "POST":
+                return self._method_not_allowed(start_response, method, "POST")
+            form = self._read_form(environ)
+            if not self.sessions.valid_csrf(self._form_value(form, "csrf")):
+                return self._forbidden(start_response, method)
+            try:
+                source, _ = self._discover_source(self._form_value(form, "url").strip())
+                self.source_store.save(source)
+                self._refresh_sources()
+            except (FetchError, ExtractionError, ConfigurationError, OSError) as exc:
+                return self._admin_html(
+                    start_response,
+                    method,
+                    self._admin_index_page(f"Automatische Prüfung fehlgeschlagen: {exc}"),
+                    status="400 Bad Request",
+                )
+            kind = "native" if source.source_type == "native" else "generated"
+            return self._redirect(start_response, f"/admin?created={kind}")
+
         edit_match = re.fullmatch(
             r"/admin/sources/([a-z0-9][a-z0-9-]{1,62}[a-z0-9])/edit", path
         )
@@ -380,6 +701,7 @@ class RegionalRssApplication:
                     status="400 Bad Request",
                 )
             self.source_store.delete(source_id)
+            self.accounts.release_any(source_id)
             self._refresh_sources()
             return self._redirect(start_response, "/admin?changed=deleted")
 
@@ -529,6 +851,127 @@ class RegionalRssApplication:
             show_navigation=False,
         )
 
+    def _account_login_page(
+        self, error: str | None = None, username: str = ""
+    ) -> str:
+        message = f'<p class="message error">{html.escape(error)}</p>' if error else ""
+        register = (
+            '<p>Noch kein Konto? <a href="/register">Jetzt registrieren</a>.</p>'
+            if self.settings.allow_registration
+            else ""
+        )
+        return self._account_layout(
+            "Anmelden",
+            f"""
+            <main class="narrow"><h1>Anmelden</h1>
+              <p>Verwalte die von dir erstellten RSS-Feeds.</p>{message}
+              <form method="post" action="/login">
+                <label>Benutzername<input name="username" value="{html.escape(username, quote=True)}" autocomplete="username" required autofocus></label>
+                <label>Passwort<input type="password" name="password" autocomplete="current-password" required></label>
+                <button type="submit">Anmelden</button>
+              </form>{register}<p><a href="/">Öffentliche Feeds ansehen</a></p>
+            </main>""",
+        )
+
+    def _account_register_page(
+        self, error: str | None = None, username: str = ""
+    ) -> str:
+        message = f'<p class="message error">{html.escape(error)}</p>' if error else ""
+        return self._account_layout(
+            "Registrieren",
+            f"""
+            <main class="narrow"><h1>Konto erstellen</h1>
+              <p>Danach kannst du Webseiten prüfen und eigene Feeds anlegen.</p>{message}
+              <form method="post" action="/register">
+                <label>Benutzername <small>3–32 Zeichen</small><input name="username" value="{html.escape(username, quote=True)}" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{{2,31}}" autocomplete="username" required autofocus></label>
+                <label>Passwort <small>mindestens 12 Zeichen</small><input type="password" name="password" minlength="12" autocomplete="new-password" required></label>
+                <label>Passwort wiederholen<input type="password" name="password_confirm" minlength="12" autocomplete="new-password" required></label>
+                <button type="submit">Konto erstellen</button>
+              </form><p><a href="/login">Bereits registriert?</a></p>
+            </main>""",
+        )
+
+    def _my_feeds_page(self, username: str, query_string: str = "") -> str:
+        assert self.user_sessions is not None
+        source_ids = self.accounts.source_ids(username)
+        csrf = html.escape(self.user_sessions.csrf_token(username), quote=True)
+        cards: list[str] = []
+        for source_id in source_ids:
+            source = self.sources.get(source_id)
+            if source is None:
+                continue
+            feed_url = (
+                source.native_feed_url
+                if source.source_type == "native"
+                else f"/feeds/{source.source_id}.xml"
+            )
+            badge = "Vorhandener Original-Feed" if source.source_type == "native" else "Von RegionalRSS erzeugt"
+            cards.append(
+                '<article class="source-card"><div>'
+                f'<span class="badge">{badge}</span><h2>{html.escape(source.name)}</h2>'
+                f'<p>{html.escape(source.description)}</p><code>{html.escape(feed_url or "")}</code></div>'
+                '<div class="actions">'
+                f'<a class="button" href="{html.escape(feed_url or "", quote=True)}">Feed öffnen</a>'
+                f'<form method="post" action="/my-feeds/{html.escape(source_id, quote=True)}/delete">'
+                f'<input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Löschen</button></form>'
+                '</div></article>'
+            )
+        params = parse_qs(query_string)
+        if params.get("created") == ["native"]:
+            message = '<p class="message success">Die Webseite besitzt bereits einen Feed. Er wurde übernommen.</p>'
+        elif params.get("created") == ["generated"]:
+            message = '<p class="message success">Kein Feed gefunden – RegionalRSS hat einen erzeugt.</p>'
+        elif "deleted" in params:
+            message = '<p class="message success">Feed wurde gelöscht.</p>'
+        else:
+            message = ""
+        empty = "<p>Du hast noch keine Feeds angelegt.</p>" if not cards else ""
+        return self._account_layout(
+            "Meine Feeds",
+            f"""
+            <nav><a href="/">Öffentliche Feeds</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}"><button class="link">Abmelden</button></form></nav>
+            <main><div class="title-row"><div><h1>Meine Feeds</h1><p>Angemeldet als {html.escape(username)}</p></div><a class="button" href="/my-feeds/new">Webseite hinzufügen</a></div>
+            {message}{empty}<section class="source-list">{''.join(cards)}</section></main>""",
+        )
+
+    def _new_feed_page(
+        self, username: str, error: str | None = None, url: str = ""
+    ) -> str:
+        assert self.user_sessions is not None
+        csrf = html.escape(self.user_sessions.csrf_token(username), quote=True)
+        message = f'<p class="message error">{html.escape(error)}</p>' if error else ""
+        return self._account_layout(
+            "Webseite hinzufügen",
+            f"""
+            <nav><a href="/">Öffentliche Feeds</a><a href="/my-feeds">Meine Feeds</a></nav>
+            <main class="narrow"><h1>Webseite hinzufügen</h1>
+              <p>RegionalRSS sucht zuerst nach einem vorhandenen RSS- oder Atom-Feed. Falls keiner vorhanden ist, wird die Meldungsliste automatisch erkannt.</p>{message}
+              <form method="post" action="/my-feeds/create">
+                <input type="hidden" name="csrf" value="{csrf}">
+                <label>Seite mit Meldungen<input type="url" name="url" value="{html.escape(url, quote=True)}" placeholder="https://www.example.de/aktuelles/" required autofocus></label>
+                <label>Eigener Name <small>optional</small><input name="name" maxlength="160"></label>
+                <button type="submit">Prüfen und Feed anlegen</button>
+              </form>
+            </main>""",
+        )
+
+    def _account_layout(self, title: str, body: str) -> str:
+        return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow">
+<title>{html.escape(title)} – RegionalRSS</title><style>
+:root {{ color-scheme:light dark; font-family:system-ui,sans-serif; --accent:#e06b20; }}
+* {{ box-sizing:border-box; }} body {{ max-width:960px; margin:auto; padding:1.5rem; line-height:1.5; }}
+nav,.title-row,.actions {{ display:flex; align-items:center; gap:.8rem; flex-wrap:wrap; }} nav {{ justify-content:flex-end; margin-bottom:2rem; }} nav form {{ margin:0; }}
+.title-row {{ justify-content:space-between; }} h1,h2,p {{ margin-top:0; }} form {{ display:grid; gap:1rem; }}
+label {{ display:grid; gap:.35rem; font-weight:600; }} small {{ font-weight:400; opacity:.75; }} input {{ padding:.75rem; border:1px solid #8888; border-radius:8px; font:inherit; }}
+button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:var(--accent); color:#fff; font:inherit; font-weight:700; text-decoration:none; cursor:pointer; }}
+button.link {{ background:none; color:inherit; padding:0; text-decoration:underline; }} .danger {{ background:#b42318; }}
+.narrow {{ max-width:520px; margin:6vh auto; }} .source-list {{ display:grid; gap:1rem; }} .source-card {{ border:1px solid #8886; border-radius:12px; padding:1rem; display:flex; justify-content:space-between; gap:1rem; align-items:center; }}
+.source-card form {{ display:block; }} .badge {{ font-size:.8rem; opacity:.8; }} code {{ overflow-wrap:anywhere; }}
+.message {{ padding:1rem; border-radius:10px; }} .error {{ background:#b4231822; border:1px solid #b42318; }} .success {{ background:#16803c22; border:1px solid #16803c; }}
+@media(max-width:699px) {{ .source-card {{ align-items:flex-start; flex-direction:column; }} }}
+</style></head><body>{body}</body></html>"""
+
     def _admin_index_page(self, error: str | None = None) -> str:
         assert self.sessions is not None
         message = (
@@ -538,14 +981,20 @@ class RegionalRssApplication:
         csrf = html.escape(self.sessions.csrf_token(), quote=True)
         for source in sorted(self.sources.values(), key=lambda item: item.name.casefold()):
             source_id = html.escape(source.source_id, quote=True)
+            edit_action = (
+                ""
+                if source.source_type == "native"
+                else f'<a class="button secondary" href="/admin/sources/{source_id}/edit">Bearbeiten</a>'
+            )
+            feed_target = html.escape(source.native_feed_url or f"/feeds/{source_id}.xml", quote=True)
             cards.append(
                 '<article class="source-card">'
                 f"<div><h2>{html.escape(source.name)}</h2>"
                 f"<p>{html.escape(source.description)}</p>"
-                f"<code>/feeds/{source_id}.xml</code></div>"
+                f"<code>{feed_target}</code></div>"
                 '<div class="actions">'
-                f'<a class="button secondary" href="/admin/sources/{source_id}/edit">Bearbeiten</a>'
-                f'<a class="button secondary" href="/feeds/{source_id}.xml">Feed öffnen</a>'
+                f'{edit_action}'
+                f'<a class="button secondary" href="{feed_target}">Feed öffnen</a>'
                 f'<form method="post" action="/admin/sources/{source_id}/delete">'
                 f'<input type="hidden" name="csrf" value="{csrf}">'
                 '<button class="danger" type="submit">Löschen</button></form>'
@@ -560,6 +1009,13 @@ class RegionalRssApplication:
                 <a class="button" href="/admin/sources/new">Neue Webseite</a>
               </div>
               {message}
+              <form method="post" action="/admin/sources/auto" class="quick-add">
+                <input type="hidden" name="csrf" value="{csrf}">
+                <label>Webseite automatisch prüfen
+                  <span class="inline"><input type="url" name="url" placeholder="https://www.example.de/aktuelles/" required><button type="submit">Prüfen und anlegen</button></span>
+                </label>
+                <small>Vorhandene Feeds werden übernommen. Andernfalls versucht RegionalRSS, die Meldungen automatisch zu erkennen.</small>
+              </form>
               <section class="source-list">{''.join(cards)}</section>
             </main>
             """,
@@ -697,7 +1153,7 @@ class RegionalRssApplication:
             </nav>
             """
         return f"""<!doctype html>
-<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow">
 <title>{html.escape(title)} – RegionalRSS</title>
 <style>
 :root {{ color-scheme: light dark; font-family: system-ui, sans-serif; --accent:#e06b20; }}
@@ -712,6 +1168,7 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
 .message,.preview {{ padding:1rem; border-radius:10px; }} .error {{ background:#b4231822; border:1px solid #b42318; }} .preview {{ background:#16803c22; border:1px solid #16803c; margin-bottom:1rem; }}
 .rule-grid {{ display:grid; grid-template-columns:minmax(100px,.6fr) minmax(220px,2fr) minmax(100px,.7fr); gap:.6rem; align-items:center; }}
 .table-wrap {{ overflow:auto; }} table {{ border-collapse:collapse; width:100%; }} th,td {{ text-align:left; border-bottom:1px solid #8886; padding:.5rem; }} .narrow {{ max-width:440px; margin:8vh auto; }}
+.quick-add {{ padding:1rem; border:1px solid #8886; border-radius:12px; margin-bottom:1rem; }} .inline {{ display:flex; gap:.6rem; }} .inline input {{ flex:1; }}
 @media (min-width:700px) {{ .grid.two {{ grid-template-columns:1fr 1fr; }} .grid.three {{ grid-template-columns:repeat(3,1fr); }} }}
 @media (max-width:699px) {{ .source-card {{ align-items:flex-start; flex-direction:column; }} .rule-grid {{ grid-template-columns:1fr; }} .rule-grid > strong {{ display:none; }} }}
 </style></head><body>{navigation}{body}</body></html>"""
@@ -720,15 +1177,22 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
         cards: list[str] = []
         for source in sorted(self.sources.values(), key=lambda item: item.name.casefold()):
             feed_path = f"/feeds/{source.source_id}.xml"
+            feed_target = source.native_feed_url or feed_path
+            badge = (
+                "Vorhandener Original-Feed"
+                if source.source_type == "native"
+                else "Von RegionalRSS erzeugt"
+            )
             cards.append(
                 "<article>"
+                f'<small>{badge}</small>'
                 f"<h2>{html.escape(source.name)}</h2>"
                 f"<p>{html.escape(source.description)}</p>"
                 '<div class="actions">'
-                f'<a class="feed" href="{feed_path}">RSS-Feed öffnen</a>'
+                f'<a class="feed" href="{html.escape(feed_target, quote=True)}">RSS-Feed öffnen</a>'
                 f'<a href="{html.escape(source.site_url, quote=True)}">Originalseite</a>'
                 "</div>"
-                f'<code>{html.escape(feed_path)}</code>'
+                f'<code>{html.escape(feed_target)}</code>'
                 "</article>"
             )
         cards_html = "".join(cards)
@@ -736,11 +1200,17 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
         admin_link = (
             '<a href="/admin">Quellen verwalten</a>' if self.sessions is not None else ""
         )
+        account_link = (
+            '<a href="/my-feeds">Eigene Feeds verwalten</a>'
+            if self.user_sessions is not None
+            else ""
+        )
         return f"""<!doctype html>
 <html lang="de">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
   <title>{title}</title>
   <style>
     :root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
@@ -765,7 +1235,7 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
   <main>{cards_html}</main>
   <footer>
     Bilder werden nicht gespeichert oder weiterverteilt. Der RSS-Client lädt sie bei Bedarf direkt von der jeweiligen Originalseite.
-    {admin_link}
+    {admin_link} {account_link}
   </footer>
 </body>
 </html>"""
@@ -816,6 +1286,22 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
         start_response("303 See Other", headers)
         return [b""]
 
+    @staticmethod
+    def _native_feed_redirect(
+        start_response: StartResponse, location: str, *, method: str
+    ) -> list[bytes]:
+        start_response(
+            "307 Temporary Redirect",
+            [
+                ("Location", location),
+                ("Content-Length", "0"),
+                ("Cache-Control", "public, max-age=300"),
+                ("X-Content-Type-Options", "nosniff"),
+                ("X-Robots-Tag", "noindex, nofollow"),
+            ],
+        )
+        return [b""]
+
     def _method_not_allowed(
         self, start_response: StartResponse, method: str, allowed: str
     ) -> list[bytes]:
@@ -859,6 +1345,7 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
             ("Content-Length", str(len(body))),
             ("X-Content-Type-Options", "nosniff"),
             ("Referrer-Policy", "no-referrer"),
+            ("X-Robots-Tag", "noindex, nofollow"),
         ]
         if extra_headers:
             headers.extend(extra_headers)

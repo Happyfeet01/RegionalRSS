@@ -51,17 +51,27 @@ def parse_source(raw: object, context: str = "source") -> SourceConfig:
             f"{context}: id must contain 3-64 lowercase letters, digits or hyphens"
         )
 
-    fields_raw = raw.get("fields")
+    source_type = str(raw.get("source_type", "scrape")).strip()
+    if source_type not in {"scrape", "native"}:
+        raise ConfigurationError(f"{context}: source_type must be 'scrape' or 'native'")
+    native_feed_url = raw.get("native_feed_url")
+    if source_type == "native":
+        if not isinstance(native_feed_url, str) or not native_feed_url.strip():
+            raise ConfigurationError(f"{context}: native_feed_url is required")
+        native_feed_url = _validate_http_url(native_feed_url.strip(), context)
+
+    fields_raw = raw.get("fields", {})
     if not isinstance(fields_raw, dict):
         raise ConfigurationError(f"{context}: 'fields' must be a mapping")
 
     fields: dict[str, FieldRule] = {}
     for name in REQUIRED_FIELDS:
-        if name not in fields_raw:
-            raise ConfigurationError(f"{context}: required field '{name}' is missing")
-        fields[name] = _parse_rule(
-            fields_raw[name], f"{context}: fields.{name}", required=True
-        )
+        if source_type == "scrape":
+            if name not in fields_raw:
+                raise ConfigurationError(f"{context}: required field '{name}' is missing")
+            fields[name] = _parse_rule(
+                fields_raw[name], f"{context}: fields.{name}", required=True
+            )
     for name in OPTIONAL_FIELDS:
         if name in fields_raw:
             fields[name] = _parse_rule(
@@ -101,10 +111,16 @@ def parse_source(raw: object, context: str = "source") -> SourceConfig:
         cache_seconds=cache_seconds,
         max_items=max_items,
         min_items=min_items,
-        item_xpath=_require_text(raw, "item_xpath", context),
+        item_xpath=(
+            _require_text(raw, "item_xpath", context)
+            if source_type == "scrape"
+            else ""
+        ),
         fields=fields,
         date_formats=tuple(date_formats_raw),
         categories=tuple(value.strip() for value in categories_raw),
+        source_type=source_type,
+        native_feed_url=native_feed_url,
     )
 
 
@@ -122,7 +138,7 @@ def source_to_mapping(source: SourceConfig) -> dict[str, Any]:
         fields[name] = {"xpath": rule.xpath}
         if rule.attribute:
             fields[name]["attribute"] = rule.attribute
-    return {
+    mapping = {
         "id": source.source_id,
         "name": source.name,
         "description": source.description,
@@ -138,6 +154,10 @@ def source_to_mapping(source: SourceConfig) -> dict[str, Any]:
         "date_formats": list(source.date_formats),
         "categories": list(source.categories),
     }
+    if source.source_type == "native":
+        mapping["source_type"] = "native"
+        mapping["native_feed_url"] = source.native_feed_url
+    return mapping
 
 
 def load_sources(directory: Path) -> dict[str, SourceConfig]:

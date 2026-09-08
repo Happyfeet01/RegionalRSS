@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- URL-basierte automatische Erkennung über Admin- und Nutzeroberfläche
+- vorhandene RSS-, Atom- und JSON-Feeds erkennen, validieren und übernehmen
+- HTML-Meldungslisten automatisch in RegionalRSS-Quellen umwandeln
+- selbst registrierbare Nutzerkonten mit persönlicher Feed-Verwaltung
+- öffentliche Übersicht für vorhandene und erzeugte Feeds
+- `noindex, nofollow` per HTML, HTTP und `robots.txt`
+- fertige Quellenkonfiguration für die Pressemitteilungen der Gemeinde Neuhof
+
 ## 0.2.0
 
 - geschützte Administrationsoberfläche unter `/admin`

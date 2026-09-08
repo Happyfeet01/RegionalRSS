@@ -72,12 +72,14 @@ def fetch_html(
     etag: str | None = None,
     last_modified: str | None = None,
     allow_private_hosts: bool = False,
+    accepted_content_types: set[str] | None = None,
+    accept_header: str | None = None,
 ) -> FetchResult:
     validate_public_url(url, allow_private_hosts=allow_private_hosts)
 
     headers = {
         "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml;q=0.9",
+        "Accept": accept_header or "text/html,application/xhtml+xml;q=0.9",
         "Accept-Language": "de,en;q=0.7",
         "Connection": "close",
     }
@@ -107,7 +109,8 @@ def fetch_html(
         final_url = response.geturl()
         validate_public_url(final_url, allow_private_hosts=allow_private_hosts)
         content_type = response.headers.get_content_type()
-        if content_type not in {"text/html", "application/xhtml+xml"}:
+        allowed_types = accepted_content_types or {"text/html", "application/xhtml+xml"}
+        if content_type not in allowed_types:
             raise FetchError(f"Unexpected source content type: {content_type}")
         raw = response.read(max_response_bytes + 1)
         if len(raw) > max_response_bytes:

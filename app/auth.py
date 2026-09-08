@@ -118,3 +118,62 @@ class SessionManager:
             self.secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
         ).digest()
         return _encode(digest)
+
+
+@dataclass(frozen=True)
+class UserSessionManager:
+    secret: str
+
+    def create_cookie(self, username: str, *, secure: bool) -> str:
+        expires = int(time.time()) + SESSION_SECONDS
+        payload = f"{username}|{expires}"
+        flags = [
+            f"regionalrss_user_session={_encode(payload.encode('utf-8'))}.{self._sign(payload)}",
+            "Path=/",
+            f"Max-Age={SESSION_SECONDS}",
+            "HttpOnly",
+            "SameSite=Lax",
+        ]
+        if secure:
+            flags.append("Secure")
+        return "; ".join(flags)
+
+    @staticmethod
+    def clear_cookie(*, secure: bool) -> str:
+        flags = [
+            "regionalrss_user_session=",
+            "Path=/",
+            "Max-Age=0",
+            "HttpOnly",
+            "SameSite=Lax",
+        ]
+        if secure:
+            flags.append("Secure")
+        return "; ".join(flags)
+
+    def username(self, cookie_header: str) -> str | None:
+        try:
+            cookies = SimpleCookie(cookie_header)
+            value = cookies["regionalrss_user_session"].value
+            encoded_payload, signature = value.rsplit(".", 1)
+            payload = _decode(encoded_payload).decode("utf-8")
+            username, expires_raw = payload.rsplit("|", 1)
+            if int(expires_raw) < int(time.time()):
+                return None
+            if not hmac.compare_digest(signature, self._sign(payload)):
+                return None
+            return username
+        except (KeyError, ValueError, UnicodeDecodeError):
+            return None
+
+    def csrf_token(self, username: str) -> str:
+        return self._sign(f"csrf|{username}")
+
+    def valid_csrf(self, username: str, token: str) -> bool:
+        return hmac.compare_digest(token, self.csrf_token(username))
+
+    def _sign(self, payload: str) -> str:
+        digest = hmac.new(
+            self.secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+        ).digest()
+        return _encode(digest)
