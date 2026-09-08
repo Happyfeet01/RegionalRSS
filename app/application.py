@@ -8,13 +8,13 @@ import logging
 import os
 import re
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 
-from .account_store import AccountStore
+from .account_store import AccountStore, VerificationThrottled
 from .auth import SessionManager, UserSessionManager, hash_password, verify_password
 from .cache import FeedCache
 from .config import parse_source
@@ -22,6 +22,7 @@ from .discovery import analyze_page, validate_feed_document
 from .extractor import extract_items
 from .feed import build_rss
 from .fetcher import FetchError, fetch_html
+from .mailer import MailDeliveryError, MailSettings, VerificationMailer, normalize_email
 from .models import (
     ConfigurationError,
     ExtractionError,
@@ -54,6 +55,7 @@ class Settings:
     max_sources_per_user: int = 20
     accounts_path: Path | None = None
     default_sources_dir: Path | None = None
+    mail: MailSettings = field(default_factory=MailSettings)
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -106,6 +108,7 @@ class Settings:
                 if os.getenv("REGIONALRSS_DEFAULT_SOURCES_DIR")
                 else None
             ),
+            mail=MailSettings.from_environment(),
         )
 
 
@@ -149,6 +152,12 @@ class RegionalRssApplication:
         self.user_sessions = (
             UserSessionManager(settings.session_secret) if settings.session_secret else None
         )
+        self.mailer = VerificationMailer(settings.mail, settings.public_base_url)
+        if settings.allow_registration and not self.mailer.configured:
+            LOGGER.warning(
+                "Registration unavailable: configure REGIONALRSS_SMTP_HOST, "
+                "REGIONALRSS_MAIL_FROM, SMTP settings and HTTPS REGIONALRSS_PUBLIC_BASE_URL"
+            )
 
     def _seed_default_sources(self) -> None:
         defaults = self.settings.default_sources_dir
@@ -176,7 +185,7 @@ class RegionalRssApplication:
                     extra_headers=[("Cache-Control", "no-store")],
                 )
 
-        if path in {"/login", "/register", "/logout", "/my-feeds"} or path.startswith(
+        if path in {"/login", "/register", "/logout", "/my-feeds", "/verify-email", "/verify-email/resend"} or path.startswith(
             "/my-feeds/"
         ):
             try:
@@ -368,6 +377,143 @@ class RegionalRssApplication:
             suffix += 1
         return replace(result.source, source_id=source_id), result.items
 
+    def _registration_unavailable(self, start_response: StartResponse, method: str) -> list[bytes]:
+        return self._account_html(
+            start_response, method,
+            self._account_login_page("Die Registrierung ist vorübergehend nicht verfügbar, da der E-Mail-Versand noch nicht eingerichtet ist."),
+            status="503 Service Unavailable",
+        )
+
+    def _register_account(self, environ: dict, start_response: StartResponse, method: str) -> list[bytes]:
+        if not self.mailer.configured:
+            return self._registration_unavailable(start_response, method)
+        # Use the actual peer, never an untrusted client-supplied forwarded header.
+        peer_key = hmac.new(
+            self.settings.session_secret.encode(),
+            str(environ.get("REMOTE_ADDR", "unknown")).encode(), hashlib.sha256,
+        ).hexdigest()
+        if not self.accounts.take_rate_limit(f"register:{peer_key}", limit=10, seconds=900):
+            return self._account_html(
+                start_response, method,
+                self._account_register_page("Zu viele Registrierungsversuche. Bitte in 15 Minuten erneut versuchen."),
+                status="429 Too Many Requests", extra_headers=[("Retry-After", "900")],
+            )
+        form = self._read_form(environ)
+        requested = self._form_value(form, "username").strip()
+        email = self._form_value(form, "email")
+        password = self._form_value(form, "password")
+        confirmation = self._form_value(form, "password_confirm")
+        try:
+            if not USERNAME_RE.fullmatch(requested):
+                raise ValueError("Der Benutzername muss 3–32 Zeichen lang sein.")
+            email = normalize_email(email)
+            if password != confirmation:
+                raise ValueError("Die Passwörter stimmen nicht überein.")
+            if not 12 <= len(password) <= 1024:
+                raise ValueError("Das Passwort muss 12 bis 1024 Zeichen enthalten.")
+            if not self.accounts.create(requested, hash_password(password), email=email):
+                raise ValueError("Benutzername oder E-Mail-Adresse bereits vergeben. Bitte anmelden, um eine neue Bestätigungsmail anzufordern.")
+        except ValueError as exc:
+            return self._account_html(
+                start_response, method, self._account_register_page(str(exc), requested, email),
+                status="400 Bad Request",
+            )
+        cookie = self.user_sessions.create_cookie(requested, secure=self._is_https(environ))
+        message, status = self._send_verification(requested)
+        if status != "200 OK":
+            return self._account_html(
+                start_response, method, self._verification_pending_page(requested, message),
+                status=status, extra_headers=[("Set-Cookie", cookie)],
+            )
+        return self._redirect(
+            start_response, "/verify-email?sent=1", extra_headers=[("Set-Cookie", cookie)]
+        )
+
+    def _send_verification(self, username: str) -> tuple[str, str]:
+        if not self.mailer.configured:
+            return "Der E-Mail-Versand ist derzeit nicht eingerichtet. Bitte später erneut versuchen.", "503 Service Unavailable"
+        if not self.accounts.take_rate_limit(f"verification:{username.lower()}", limit=5, seconds=3600):
+            return "Zu viele Versandversuche. Bitte in einer Stunde erneut versuchen.", "429 Too Many Requests"
+        try:
+            token = self.accounts.issue_verification(username)
+        except VerificationThrottled as exc:
+            return str(exc), "429 Too Many Requests"
+        if token is None:
+            return "Für dieses Konto ist keine Bestätigung nötig.", "200 OK"
+        try:
+            account = self.accounts.get(username)
+            self.mailer.send_verification(account.email, token)
+        except MailDeliveryError:
+            # Keep the pending account for a password-authenticated retry; do not
+            # silently activate it or leave an unsent token valid.
+            self.accounts.discard_verification(token)
+            return "Die Bestätigungsmail konnte nicht versendet werden. Dein Konto bleibt vorgemerkt. Bitte in einer Minute erneut anfordern oder später anmelden.", "503 Service Unavailable"
+        return "Die Bestätigungsmail wurde versendet. Bitte prüfe auch deinen Spamordner.", "200 OK"
+
+    def _handle_verification(
+        self, environ: dict, start_response: StartResponse, method: str, username: str | None
+    ) -> list[bytes]:
+        if method not in {"GET", "POST"}:
+            return self._method_not_allowed(start_response, method, "GET, POST")
+        if method == "POST":
+            token = self._form_value(self._read_form(environ), "token")
+            # The random, one-use bearer token authenticates this action. It
+            # confirms the email only and never creates a login session.
+            if self.accounts.confirm_email(token):
+                return self._redirect(start_response, "/verify-email?confirmed=1")
+            return self._account_html(
+                start_response, method, self._verification_invalid_page(), status="400 Bad Request"
+            )
+        params = parse_qs(environ.get("QUERY_STRING", ""))
+        token = self._form_value(params, "token")
+        if token:
+            if not self.accounts.verification_valid(token):
+                return self._account_html(
+                    start_response, method, self._verification_invalid_page(), status="400 Bad Request"
+                )
+            page = self._account_layout("E-Mail bestätigen", f'''
+                <main class="narrow"><h1>E-Mail-Adresse bestätigen</h1>
+                <p>Bestätige hier die E-Mail-Adresse für dein RegionalRSS-Konto.</p>
+                <form method="post" action="/verify-email">
+                  <input type="hidden" name="token" value="{html.escape(token, quote=True)}">
+                  <button type="submit">E-Mail-Adresse bestätigen</button>
+                </form></main>''')
+            return self._account_html(start_response, method, page)
+        if params.get("confirmed") == ["1"]:
+            return self._account_html(start_response, method, self._account_layout(
+                "E-Mail bestätigt", '<main class="narrow"><h1>E-Mail bestätigt</h1>'
+                '<p>Du kannst jetzt deine Feeds verwalten.</p><a class="button" href="/my-feeds">Weiter zu meinen Feeds</a></main>'
+            ))
+        if not username:
+            return self._redirect(start_response, "/login")
+        if self.accounts.get(username).active:
+            return self._redirect(start_response, "/my-feeds")
+        message = "Die Bestätigungsmail wurde versendet." if params.get("sent") == ["1"] else ""
+        return self._account_html(start_response, method, self._verification_pending_page(username, message))
+
+    def _verification_invalid_page(self) -> str:
+        return self._account_layout("Bestätigungslink ungültig", '''
+            <main class="narrow"><h1>Bestätigungslink ungültig</h1>
+            <p>Dieser Link ist abgelaufen, bereits verwendet oder ungültig.</p>
+            <p>Melde dich an, um bei Bedarf eine neue Bestätigungsmail anzufordern.</p>
+            <a class="button" href="/login">Zur Anmeldung</a></main>''')
+
+    def _verification_pending_page(self, username: str, message: str = "") -> str:
+        account = self.accounts.get(username)
+        csrf = html.escape(self.user_sessions.csrf_token(username), quote=True)
+        return self._account_layout("E-Mail bestätigen", f'''
+            <main class="narrow"><h1>Bitte bestätige deine E-Mail-Adresse</h1>
+            <p>{html.escape(message)}</p>
+            <p>Dein Konto ist vorgemerkt. Öffne den Bestätigungslink für
+            <strong>{html.escape(account.email or '')}</strong>, bevor du Feeds anlegst.</p>
+            <p>Der Link gilt 24 Stunden. Bitte prüfe auch deinen Spamordner.</p>
+            <form method="post" action="/verify-email/resend">
+              <input type="hidden" name="csrf" value="{csrf}">
+              <button type="submit">Bestätigungsmail erneut senden</button>
+            </form><p>Erneuter Versand frühestens nach einer Minute.</p>
+            <form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}">
+              <button class="link" type="submit">Abmelden</button></form></main>''')
+
     def _handle_account(
         self,
         environ: dict,
@@ -384,8 +530,26 @@ class RegionalRssApplication:
             )
 
         username = self.user_sessions.username(environ.get("HTTP_COOKIE", ""))
-        if username and not self.accounts.exists(username):
-            username = None
+        account = self.accounts.get(username) if username else None
+        username = account.username if account else None
+
+        if path == "/verify-email":
+            return self._handle_verification(environ, start_response, method, username)
+
+        if path == "/verify-email/resend":
+            if method != "POST":
+                return self._method_not_allowed(start_response, method, "POST")
+            if not username:
+                return self._redirect(start_response, "/login")
+            form = self._read_form(environ)
+            if not self.user_sessions.valid_csrf(username, self._form_value(form, "csrf")):
+                return self._forbidden(start_response, method)
+            if account.active:
+                return self._redirect(start_response, "/my-feeds")
+            message, status = self._send_verification(username)
+            return self._account_html(
+                start_response, method, self._verification_pending_page(username, message), status=status
+            )
 
         if path == "/register":
             if not self.settings.allow_registration:
@@ -399,52 +563,20 @@ class RegionalRssApplication:
                 )
             if method == "GET":
                 if username:
-                    return self._redirect(start_response, "/my-feeds")
+                    return self._redirect(start_response, "/my-feeds" if account.active else "/verify-email")
+                if not self.mailer.configured:
+                    return self._registration_unavailable(start_response, method)
                 return self._account_html(
                     start_response, method, self._account_register_page()
                 )
             if method == "POST":
-                form = self._read_form(environ)
-                requested = self._form_value(form, "username").strip()
-                password = self._form_value(form, "password")
-                confirmation = self._form_value(form, "password_confirm")
-                if not USERNAME_RE.fullmatch(requested):
-                    error = "Der Benutzername muss 3–32 Zeichen lang sein."
-                elif password != confirmation:
-                    error = "Die Passwörter stimmen nicht überein."
-                else:
-                    try:
-                        encoded = hash_password(password)
-                    except ValueError:
-                        error = "Das Passwort muss mindestens 12 Zeichen enthalten."
-                    else:
-                        if not self.accounts.create(requested, encoded):
-                            error = "Dieser Benutzername ist bereits vergeben."
-                        else:
-                            return self._redirect(
-                                start_response,
-                                "/my-feeds",
-                                extra_headers=[
-                                    (
-                                        "Set-Cookie",
-                                        self.user_sessions.create_cookie(
-                                            requested, secure=self._is_https(environ)
-                                        ),
-                                    )
-                                ],
-                            )
-                return self._account_html(
-                    start_response,
-                    method,
-                    self._account_register_page(error, requested),
-                    status="400 Bad Request",
-                )
+                return self._register_account(environ, start_response, method)
             return self._method_not_allowed(start_response, method, "GET, POST")
 
         if path == "/login":
             if method == "GET":
                 if username:
-                    return self._redirect(start_response, "/my-feeds")
+                    return self._redirect(start_response, "/my-feeds" if account.active else "/verify-email")
                 return self._account_html(
                     start_response, method, self._account_login_page()
                 )
@@ -464,14 +596,15 @@ class RegionalRssApplication:
                         ),
                         status="401 Unauthorized",
                     )
+                signed_in = self.accounts.get(requested)
                 return self._redirect(
                     start_response,
-                    "/my-feeds",
+                    "/my-feeds" if signed_in.active else "/verify-email",
                     extra_headers=[
                         (
                             "Set-Cookie",
                             self.user_sessions.create_cookie(
-                                requested, secure=self._is_https(environ)
+                                signed_in.username, secure=self._is_https(environ)
                             ),
                         )
                     ],
@@ -498,6 +631,11 @@ class RegionalRssApplication:
                     )
                 ],
             )
+
+        # Check database state on every request, including pre-verification cookies
+        # and direct POSTs; a signed login cookie alone does not activate an account.
+        if not account.active:
+            return self._redirect(start_response, "/verify-email")
 
         self._refresh_sources()
         if path == "/my-feeds":
@@ -894,16 +1032,17 @@ class RegionalRssApplication:
         )
 
     def _account_register_page(
-        self, error: str | None = None, username: str = ""
+        self, error: str | None = None, username: str = "", email: str = ""
     ) -> str:
         message = f'<p class="message error">{html.escape(error)}</p>' if error else ""
         return self._account_layout(
             "Registrieren",
             f"""
             <main class="narrow"><h1>Konto erstellen</h1>
-              <p>Danach kannst du Webseiten prüfen und eigene Feeds anlegen.</p>{message}
+              <p>Nach der Bestätigung deiner E-Mail-Adresse kannst du eigene Feeds anlegen.</p>{message}
               <form method="post" action="/register">
                 <label>Benutzername <small>3–32 Zeichen</small><input name="username" value="{html.escape(username, quote=True)}" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{{2,31}}" autocomplete="username" required autofocus></label>
+                <label>E-Mail-Adresse<input type="email" name="email" value="{html.escape(email, quote=True)}" maxlength="254" autocomplete="email" required></label>
                 <label>Passwort <small>mindestens 12 Zeichen</small><input type="password" name="password" minlength="12" autocomplete="new-password" required></label>
                 <label>Passwort wiederholen<input type="password" name="password_confirm" minlength="12" autocomplete="new-password" required></label>
                 <button type="submit">Konto erstellen</button>
@@ -1328,6 +1467,8 @@ button,.button {{ border:0; border-radius:8px; padding:.7rem 1rem; background:va
             ("Content-Length", "0"),
             ("Cache-Control", "no-store"),
             ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            ("X-Robots-Tag", "noindex, nofollow"),
         ]
         if extra_headers:
             headers.extend(extra_headers)
