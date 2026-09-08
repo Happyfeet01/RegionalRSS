@@ -9,6 +9,7 @@
 - öffentliche Übersicht für vorhandene und erzeugte Feeds
 - `noindex, nofollow` per HTML, HTTP und `robots.txt`
 - fertige Quellenkonfiguration für die Pressemitteilungen der Gemeinde Neuhof
+- sichere Ergänzung neuer Standardquellen in bereits bestehende Docker-Volumes
 
 ## 0.2.0
 
