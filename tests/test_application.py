@@ -244,6 +244,12 @@ class AdminApplicationTest(unittest.TestCase):
                 "allow_registration": True,
             }
         )
+        status, _, body = call_app(self.app, "/login")
+        self.assertEqual("200 OK", status)
+        self.assertIn(b"Anmelden", body)
+        status, _, body = call_app(self.app, "/register")
+        self.assertEqual("200 OK", status)
+        self.assertIn(b"Konto erstellen", body)
         status, headers, _ = call_app(
             self.app,
             "/register",
@@ -257,6 +263,9 @@ class AdminApplicationTest(unittest.TestCase):
         )
         self.assertEqual("303 See Other", status)
         cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, _, body = call_app(self.app, "/my-feeds", cookie=cookie)
+        self.assertEqual("200 OK", status)
+        self.assertIn(b"Meine Feeds", body)
         source = parse_source(
             {
                 "id": "auto-example",
