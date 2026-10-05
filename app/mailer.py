@@ -136,3 +136,42 @@ class VerificationMailer:
             # SMTP errors can contain recipients, credentials or message content.
             LOGGER.error("Verification mail delivery failed (%s)", type(exc).__name__)
             raise MailDeliveryError("Die Bestätigungsmail konnte nicht versendet werden.") from None
+
+    def send_password_reset(self, recipient: str, token: str) -> None:
+        if not self.configured:
+            raise MailDeliveryError("Mailversand ist nicht eingerichtet.")
+        settings = self.settings
+        message = EmailMessage()
+        sender = normalize_email(settings.from_address)
+        recipient = normalize_email(recipient)
+        message["From"] = formataddr((settings.from_name, sender))
+        message["To"] = recipient
+        message["Subject"] = "RegionalRSS: Passwort zurücksetzen"
+        message["Date"] = formatdate(localtime=False)
+        message["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[1])
+        message.set_content(
+            "Hallo,\n\nfür dein RegionalRSS-Konto wurde ein neues Passwort angefordert.\n\n"
+            f"{self.public_base_url}/password-reset?token={token}\n\n"
+            "Der Link ist 30 Minuten gültig und kann nur einmal verwendet werden. "
+            "Wenn du kein neues Passwort angefordert hast, kannst du diese E-Mail ignorieren.\n"
+        )
+        context = ssl.create_default_context()
+        try:
+            if settings.security == "ssl":
+                connection = smtplib.SMTP_SSL(
+                    settings.host, settings.port, timeout=settings.timeout, context=context
+                )
+            else:
+                connection = smtplib.SMTP(settings.host, settings.port, timeout=settings.timeout)
+            with connection as smtp:
+                if settings.security == "starttls":
+                    smtp.ehlo()
+                    smtp.starttls(context=context)
+                    smtp.ehlo()
+                if settings.username:
+                    smtp.login(settings.username, settings.password)
+                smtp.send_message(message, from_addr=sender, to_addrs=[recipient])
+        except (OSError, smtplib.SMTPException) as exc:
+            LOGGER.error("Password reset mail delivery failed (%s)", type(exc).__name__)
+            raise MailDeliveryError("Die Passwort-E-Mail konnte nicht versendet werden.") from None
+

@@ -12,6 +12,7 @@ from .mailer import normalize_email
 
 
 VERIFICATION_SECONDS = 24 * 60 * 60
+PASSWORD_RESET_SECONDS = 30 * 60
 RESEND_SECONDS = 60
 
 
@@ -94,6 +95,13 @@ class AccountStore:
                 connection.execute("ALTER TABLE email_verifications ADD COLUMN email TEXT COLLATE NOCASE")
                 # Preserve outstanding confirmation links from version 0.4.0.
                 connection.execute("UPDATE email_verifications SET email = (SELECT email FROM accounts WHERE accounts.username = email_verifications.username)")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    token_hash TEXT PRIMARY KEY,
+                    username TEXT NOT NULL COLLATE NOCASE,
+                    expires_at INTEGER NOT NULL,
+                    FOREIGN KEY(username) REFERENCES accounts(username) ON DELETE CASCADE
+                )""")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS account_rate_limits (
                     key TEXT PRIMARY KEY,
@@ -244,6 +252,71 @@ class AccountStore:
                 (row[1], now, row[0], row[1]),
             ).rowcount
             connection.execute("DELETE FROM email_verifications WHERE username = ?", (row[0],))
+        return bool(updated)
+
+    def issue_password_reset(self, email: str) -> tuple[str, str] | None:
+        """Create a short-lived reset token for a verified email address."""
+        email = normalize_email(email)
+        token = secrets.token_urlsafe(32)
+        now = int(time.time())
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM password_resets WHERE expires_at <= ?", (now,))
+            row = connection.execute(
+                "SELECT username, email FROM accounts "
+                "WHERE email = ? AND email_verified_at IS NOT NULL",
+                (email,),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute("DELETE FROM password_resets WHERE username = ?", (row[0],))
+            connection.execute(
+                "INSERT INTO password_resets(token_hash, username, expires_at) VALUES (?, ?, ?)",
+                (token_hash, row[0], now + PASSWORD_RESET_SECONDS),
+            )
+        return str(row[1]), token
+
+    def discard_password_reset(self, token: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            return
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM password_resets WHERE token_hash = ?",
+                (hashlib.sha256(token.encode()).hexdigest(),),
+            )
+
+    def password_reset_valid(self, token: str) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            return False
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM password_resets WHERE token_hash = ? AND expires_at > ?",
+                (hashlib.sha256(token.encode()).hexdigest(), int(time.time())),
+            ).fetchone() is not None
+
+    def reset_password(self, token: str, new_hash: str) -> bool:
+        """Consume a reset token and revoke every existing user session."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            return False
+        now = int(time.time())
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT username FROM password_resets "
+                "WHERE token_hash = ? AND expires_at > ?",
+                (token_hash, now),
+            ).fetchone()
+            if row is None:
+                connection.execute("DELETE FROM password_resets WHERE expires_at <= ?", (now,))
+                return False
+            updated = connection.execute(
+                "UPDATE accounts SET password_hash = ?, session_version = session_version + 1 "
+                "WHERE username = ?",
+                (new_hash, row[0]),
+            ).rowcount
+            connection.execute("DELETE FROM password_resets WHERE username = ?", (row[0],))
         return bool(updated)
 
     def password_hash(self, username: str) -> str | None:

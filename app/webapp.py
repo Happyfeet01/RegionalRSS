@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import re
 from typing import Iterable
+from urllib.parse import parse_qs
 
 from .application import RegionalRssApplication, Settings, StartResponse
-from .auth import verify_password
+from .auth import hash_password, verify_password
+from .mailer import MailDeliveryError, normalize_email
 from .privacy import render_privacy_page
 
 
@@ -39,10 +43,186 @@ class RegionalRssWebApplication(RegionalRssApplication):
                 ],
             )
 
+        if path == "/password-forgot":
+            return self._password_forgot(environ, start_response, method)
+
+        if path == "/password-reset":
+            return self._password_reset(environ, start_response, method)
+
         if path == "/account/delete":
             return self._delete_own_account(environ, start_response, method)
 
         return super().__call__(environ, start_response)
+
+    def _password_forgot_page(self, sent: bool = False) -> str:
+        message = (
+            '<p class="message success" role="status">Falls zu dieser Adresse ein '
+            'bestätigtes Konto existiert, wurde eine E-Mail mit weiteren Schritten '
+            'versendet.</p>'
+            if sent
+            else ""
+        )
+        return self._account_layout(
+            "Passwort vergessen",
+            f'''<main class="narrow"><h1>Passwort vergessen?</h1>
+            <p>Gib die bestätigte E-Mail-Adresse deines Nutzerkontos ein. Wir verraten
+            aus Sicherheitsgründen nicht, ob die Adresse bei RegionalRSS registriert ist.</p>
+            {message}
+            <form method="post" action="/password-forgot">
+              <label>E-Mail-Adresse
+                <input type="email" name="email" maxlength="254" autocomplete="email" required autofocus>
+              </label>
+              <button type="submit">Reset-Link anfordern</button>
+            </form>
+            <p><a href="/login">Zurück zur Anmeldung</a></p>
+            <p><small>Das Administratorkonto aus der <code>.env</code> wird weiterhin
+            serverseitig zurückgesetzt.</small></p></main>'''
+        )
+
+    def _password_reset_page(self, token: str, error: str = "") -> str:
+        message = (
+            f'<p class="message error" role="alert">{html.escape(error)}</p>'
+            if error else ""
+        )
+        return self._account_layout(
+            "Neues Passwort",
+            f'''<main class="narrow"><h1>Neues Passwort festlegen</h1>
+            <p>Der Reset-Link ist 30 Minuten gültig und kann nur einmal verwendet werden.</p>
+            {message}
+            <form method="post" action="/password-reset">
+              <input type="hidden" name="token" value="{html.escape(token, quote=True)}">
+              <label>Neues Passwort <small>mindestens 12 Zeichen</small>
+                <input type="password" name="password" minlength="12" maxlength="1024"
+                       autocomplete="new-password" required autofocus>
+              </label>
+              <label>Neues Passwort wiederholen
+                <input type="password" name="password_confirm" minlength="12" maxlength="1024"
+                       autocomplete="new-password" required>
+              </label>
+              <button type="submit">Passwort speichern</button>
+            </form></main>'''
+        )
+
+    def _password_reset_invalid_page(self) -> str:
+        return self._account_layout(
+            "Reset-Link ungültig",
+            '''<main class="narrow"><h1>Reset-Link ungültig</h1>
+            <p>Der Link ist abgelaufen, wurde bereits verwendet oder ist ungültig.</p>
+            <p><a class="button" href="/password-forgot">Neuen Reset-Link anfordern</a></p>
+            <p><a href="/login">Zur Anmeldung</a></p></main>'''
+        )
+
+    def _password_forgot(
+        self, environ: dict, start_response: StartResponse, method: str
+    ) -> list[bytes]:
+        if self.user_sessions is None:
+            return self._respond(
+                start_response, "404 Not Found", b"User accounts are not configured\n",
+                method=method,
+            )
+        if method == "GET":
+            return self._account_html(
+                start_response, method, self._password_forgot_page()
+            )
+        if method != "POST":
+            return self._method_not_allowed(start_response, method, "GET, POST")
+
+        form = self._read_form(environ)
+        try:
+            email = normalize_email(self._form_value(form, "email"))
+        except ValueError:
+            email = ""
+
+        if email and self.mailer.configured:
+            key = hmac.new(
+                (self.settings.session_secret or "").encode(),
+                ("password-reset|" + email).encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            if self.accounts.take_rate_limit(
+                f"password-reset:{key}", limit=5, seconds=3600
+            ):
+                issued = self.accounts.issue_password_reset(email)
+                if issued:
+                    recipient, token = issued
+                    try:
+                        self.mailer.send_password_reset(recipient, token)
+                    except MailDeliveryError:
+                        self.accounts.discard_password_reset(token)
+
+        # Always return the same answer so this endpoint cannot be used to find
+        # registered email addresses.
+        return self._account_html(
+            start_response, method, self._password_forgot_page(sent=True)
+        )
+
+    def _password_reset(
+        self, environ: dict, start_response: StartResponse, method: str
+    ) -> list[bytes]:
+        if self.user_sessions is None:
+            return self._respond(
+                start_response, "404 Not Found", b"User accounts are not configured\n",
+                method=method,
+            )
+        if method == "GET":
+            token = self._form_value(parse_qs(environ.get("QUERY_STRING", "")), "token")
+            if not self.accounts.password_reset_valid(token):
+                return self._account_html(
+                    start_response, method, self._password_reset_invalid_page(),
+                    status="400 Bad Request",
+                )
+            return self._account_html(
+                start_response, method, self._password_reset_page(token)
+            )
+        if method != "POST":
+            return self._method_not_allowed(start_response, method, "GET, POST")
+
+        form = self._read_form(environ)
+        token = self._form_value(form, "token")
+        if not self.accounts.password_reset_valid(token):
+            return self._account_html(
+                start_response, method, self._password_reset_invalid_page(),
+                status="400 Bad Request",
+            )
+        password = self._form_value(form, "password")
+        confirmation = self._form_value(form, "password_confirm")
+        if password != confirmation:
+            return self._account_html(
+                start_response, method,
+                self._password_reset_page(token, "Die Passwörter stimmen nicht überein."),
+                status="400 Bad Request",
+            )
+        if not 12 <= len(password) <= 1024:
+            return self._account_html(
+                start_response, method,
+                self._password_reset_page(token, "Das Passwort muss 12 bis 1024 Zeichen enthalten."),
+                status="400 Bad Request",
+            )
+        if not self.accounts.reset_password(token, hash_password(password)):
+            return self._account_html(
+                start_response, method, self._password_reset_invalid_page(),
+                status="400 Bad Request",
+            )
+        return self._account_html(
+            start_response, method,
+            self._account_layout(
+                "Passwort geändert",
+                '''<main class="narrow"><h1>Passwort geändert</h1>
+                <p>Dein neues Passwort ist gespeichert. Alle bisherigen Anmeldungen
+                wurden beendet.</p>
+                <a class="button" href="/login">Jetzt anmelden</a></main>'''
+            ),
+        )
+
+    def _account_login_page(
+        self, error: str | None = None, username: str = ""
+    ) -> str:
+        page = super()._account_login_page(error, username)
+        return page.replace(
+            "</form>",
+            '</form><p><a href="/password-forgot">Passwort vergessen?</a></p>',
+            1,
+        )
 
     def _current_user(self, environ: dict):
         if self.user_sessions is None:

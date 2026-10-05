@@ -227,6 +227,26 @@ verwendete Gerät erhält eine neue Sitzung. Nutzereinstellungen und die
 Admin-Kontenübersicht sind zugriffsgeschützt und werden nicht öffentlich gecacht.
 Adressen erscheinen weiterhin nicht im öffentlichen Feedverzeichnis.
 
+### Passwort vergessen (ab 0.6.1)
+
+Auf der Nutzeranmeldung führt „Passwort vergessen?“ zu `/password-forgot`.
+Dort wird die bestätigte E-Mail-Adresse des Kontos eingegeben. Die Antwort ist
+für registrierte und nicht registrierte Adressen bewusst identisch, damit sich
+über die Funktion keine Nutzerkonten ermitteln lassen.
+
+Ist die Adresse einem bestätigten Nutzerkonto zugeordnet, versendet RegionalRSS
+über den bereits konfigurierten SMTP-Zugang einen einmaligen Link. Der Link ist
+30 Minuten gültig. In der Datenbank wird nur der SHA-256-Hash des zufälligen
+Tokens gespeichert. Nach erfolgreichem Zurücksetzen wird der Token verbraucht
+und die Sitzungsnummer des Kontos erhöht; damit sind alle vorherigen
+Nutzersitzungen ungültig.
+
+Der Versand ist pro Adresse begrenzt. Nicht bestätigte E-Mail-Adressen können
+nicht zum Zurücksetzen des Passworts verwendet werden. Das zentrale
+Administratorkonto aus `.env` besitzt weiterhin keinen E-Mail-Reset. Dessen
+Passwort wird mit `scripts/hash_password.py` neu gehasht und anschließend über
+`REGIONALRSS_ADMIN_PASSWORD_HASH` gesetzt.
+
 Das Administratorkonto aus `.env` ist ein eigenes Systemkonto. Es hat keine
 persönliche E-Mail-Adresse und ist in der Kontenübersicht separat gekennzeichnet.
 Ein zusätzlich registriertes Nutzerkonto hat sein eigenes Profil unter

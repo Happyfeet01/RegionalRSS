@@ -30,6 +30,19 @@ class MailerTest(unittest.TestCase):
         self.assertNotIn("smtp-secret", str(message))
         self.assertEqual(["user@example.com"], smtp.send_message.call_args.kwargs["to_addrs"])
 
+    @patch("app.mailer.smtplib.SMTP")
+    def test_password_reset_mail_uses_short_lived_fixed_origin_link(self, smtp_factory):
+        smtp = smtp_factory.return_value.__enter__.return_value
+        self.mailer.send_password_reset("User@example.com", "reset-token")
+        message = smtp.send_message.call_args.args[0]
+        self.assertEqual("RegionalRSS: Passwort zurücksetzen", message["Subject"])
+        self.assertIn(
+            "https://rss.example.com/password-reset?token=reset-token",
+            message.get_content(),
+        )
+        self.assertIn("30 Minuten", message.get_content())
+        self.assertNotIn("smtp-secret", str(message))
+
     @patch("app.mailer.smtplib.SMTP_SSL")
     def test_ssl_465(self, smtp_factory):
         self.mailer.settings = replace(self.settings, security="ssl", port=465)

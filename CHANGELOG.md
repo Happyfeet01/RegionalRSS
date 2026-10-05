@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1
+
+- „Passwort vergessen?“ auf der Nutzeranmeldung
+- neutrale Reset-Anfrage ohne Offenlegung, ob eine E-Mail-Adresse registriert ist
+- einmalige Passwort-Reset-Links mit 30 Minuten Gültigkeit; nur der Token-Hash wird gespeichert
+- Reset nur für bestätigte E-Mail-Adressen
+- neues Passwort beendet alle bestehenden Nutzersitzungen
+- Versandlimits gegen Missbrauch und identische Antwort für bekannte und unbekannte Adressen
+- Datenschutzerklärung um Passwort-Reset-Tokens und Reset-E-Mails ergänzt
+- Administratorkonto aus `.env` bleibt bewusst beim serverseitigen Passwort-Reset
+
 ## 0.6.0
 
 - automatische Erkennung für Meldungslisten ohne sichtbares Veröffentlichungsdatum erweitert
