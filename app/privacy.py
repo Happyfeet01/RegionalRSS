@@ -67,7 +67,7 @@ def render_privacy_page(site_title: str) -> str:
 
     <h2>2. Welche Daten RegionalRSS verarbeitet</h2>
     <p>Für ein Nutzerkonto werden Benutzername, E-Mail-Adresse, ein kryptografischer Passwort-Hash, Zeitpunkte zur Registrierung und E-Mail-Bestätigung sowie die Zuordnung der vom Nutzer angelegten Feeds gespeichert. Das Klartext-Passwort wird nicht gespeichert.</p>
-    <p>Für E-Mail-Bestätigungen werden nur zufällige Einmal-Token in gehashter Form und mit einer Gültigkeit von höchstens 24 Stunden gespeichert. Sicherheits- und Rate-Limit-Einträge werden nur vorübergehend gespeichert und spätestens nach dem vorgesehenen kurzen Schutzzeitraum bereinigt.</p>
+    <p>Für E-Mail-Bestätigungen und die Funktion „Passwort vergessen“ werden zufällige Einmal-Token ausschließlich in gehashter Form gespeichert. Bestätigungslinks gelten höchstens 24 Stunden, Passwort-Reset-Links höchstens 30 Minuten. Nach erfolgreicher Verwendung werden die jeweiligen Token ungültig. Sicherheits- und Rate-Limit-Einträge werden nur vorübergehend gespeichert und spätestens nach dem vorgesehenen kurzen Schutzzeitraum bereinigt.</p>
 
     <h2>3. Zweck und Rechtsgrundlagen</h2>
     <p>Kontodaten werden verarbeitet, um das Nutzerkonto und die Feed-Verwaltung bereitzustellen (Art. 6 Abs. 1 lit. b DSGVO). Sicherheitsmaßnahmen wie Anmelde-, Bestätigungs- und Rate-Limits dienen dem Schutz des Dienstes und seiner Nutzer (Art. 6 Abs. 1 lit. f DSGVO). Soweit gesetzliche Pflichten bestehen, kann die Verarbeitung zusätzlich auf Art. 6 Abs. 1 lit. c DSGVO beruhen.</p>
@@ -80,7 +80,7 @@ def render_privacy_page(site_title: str) -> str:
     <p>RegionalRSS verwendet ausschließlich technisch notwendige Sitzungscookies für angemeldete Nutzer und Administratoren. Sie dienen der Anmeldung und dem Schutz vor unberechtigten Formularaufrufen. Es gibt keine Werbe-, Analyse- oder Tracking-Cookies. Nutzersitzungen sind zeitlich begrenzt.</p>
 
     <h2>6. E-Mail-Versand</h2>
-    <p>Für Registrierung und Änderung einer E-Mail-Adresse versendet RegionalRSS Bestätigungsnachrichten. Dabei werden Empfängeradresse und Nachrichteninhalt an den konfigurierten Mailanbieter übermittelt. Eingesetzter Mailanbieter: <strong>{esc(mail_provider)}</strong>.</p>
+    <p>Für Registrierung, Änderung einer E-Mail-Adresse und angeforderte Passwort-Resets versendet RegionalRSS E-Mails. Dabei werden Empfängeradresse und Nachrichteninhalt an den konfigurierten Mailanbieter übermittelt. Eingesetzter Mailanbieter: <strong>{esc(mail_provider)}</strong>.</p>
 
     <h2>7. Öffentliche Feeds und externe Webseiten</h2>
     <p>Die mit RegionalRSS erzeugten Feeds sind öffentlich abrufbar. Die Anweisung <code>noindex</code> bittet Suchmaschinen, Seiten und Feeds nicht zu indexieren; sie macht einen Feed jedoch nicht privat oder zugriffsgeschützt.</p>
