@@ -26,6 +26,8 @@ class PasswordResetTest(unittest.TestCase):
             max_response_bytes=10000,
             allow_private_hosts=False,
             site_title="RegionalRSS",
+            admin_username="admin",
+            admin_password_hash=hash_password("admin-password-long-enough"),
             session_secret="password-reset-test-secret-more-than-32-chars",
             allow_registration=True,
             mail=MailSettings(
