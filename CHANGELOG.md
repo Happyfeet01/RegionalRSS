@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2
+
+- Unterstützungslinks für die Weiterentwicklung ergänzt.
+
 ## 0.6.1
 
 - „Passwort vergessen?“ auf der Nutzeranmeldung
