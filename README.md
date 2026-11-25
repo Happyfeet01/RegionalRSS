@@ -432,6 +432,7 @@ Lizenz: MIT
 Ich entwickle und pflege dieses Projekt und weitere Open-Source-Software in meiner Freizeit. Wenn dir meine Arbeit hilft, kannst du die Weiterentwicklung freiwillig unterstützen:
 
 - [Buy Me a Coffee](https://buymeacoffee.com/sly5ir9ov)
+- [Ko-fi](https://ko-fi.com/dermueller)
 - [PayPal](https://paypal.me/LarsM1980)
 
 Genauso freue ich mich über Fehlermeldungen, Rückmeldungen, Dokumentationsverbesserungen und Beiträge zum Code. Die Unterstützung ist freiwillig.
